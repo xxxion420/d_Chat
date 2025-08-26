@@ -1,0 +1,4041 @@
+вот готовый код, оптимизируй его и разбей логически на отдельные файлы, важно сохранить всю функциональность. не давай готовый проект одним файлом, дай все файлы по отдельности
+
+
+// main.dart — Talk + медиа + апдейты (фикс-пакет с дисковым кэшем изображений)
+// - Пагинация вверх (история): lookIntoFuture=0 + X-Chat-Last-Given
+// - Сортировка чатов по lastActivity (как в Telegram)
+// - Аватарки: для комнат (room avatar API) и пользователей (/avatar/{user}/{size})
+//   + корректный fallback: первая буква в кружочке в стиле Material
+//   + фиксы: encode userId, абсолютный URL на room avatar, расширенная нормализация actorType
+// - Вкладки внизу: Чаты / Контакты
+// - Контакты: one-to-one из Talk API (includeStatus), алфавит + кнопка "начать чат"
+// - В чате: аватар комнаты/пира в AppBar; прилипание к полю ввода; корректный FAB "вниз"
+// - Вьюер фото: подгрузка более ранних фотографий при пролистывании к первому
+// - Быстрый старт чата: кеш "хвоста" сообщений при выходе/поллинге
+// - НОВОЕ: изображения из последних сообщений кэшируются на диск (как и хвост сообщений)
+
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+import 'dart:typed_data';
+import 'dart:ui' as ui;
+import 'package:flutter/services.dart';
+
+import 'package:file_picker/file_picker.dart';
+import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
+import 'package:image_picker/image_picker.dart';
+import 'package:intl/intl.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:mime/mime.dart';
+import 'package:path/path.dart' as p;
+import 'package:record/record.dart';
+import 'package:url_launcher/url_launcher.dart';
+import 'package:video_player/video_player.dart';
+import 'package:just_audio/just_audio.dart';
+import 'package:path_provider/path_provider.dart'; // кеш на диск
+
+import 'package:flutter/rendering.dart';
+
+const String kNcBase = 'https://testspc.ddns.net';
+
+void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+  runApp(const TalkApp());
+}
+
+class TalkApp extends StatelessWidget {
+  const TalkApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'Nextcloud Talk (media)',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        colorSchemeSeed: Colors.indigo,
+        useMaterial3: true,
+      ),
+      home: const _Bootstrap(),
+    );
+  }
+}
+
+class _Bootstrap extends StatefulWidget {
+  const _Bootstrap();
+
+  @override
+  State<_Bootstrap> createState() => _BootstrapState();
+}
+
+class _BootstrapState extends State<_Bootstrap> {
+  final storage = const FlutterSecureStorage();
+  String? _user;
+  String? _appPass;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    final u = await storage.read(key: 'nc_user');
+    final p = await storage.read(key: 'nc_pass');
+    if (!mounted) return;
+    setState(() {
+      _user = u;
+      _appPass = p;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_user != null && _appPass != null) {
+      return HomeTabs(api: NextcloudTalkApi(_user!, _appPass!));
+    }
+    return LoginScreen(onLogin: (u, p) async {
+      await storage.write(key: 'nc_user', value: u);
+      await storage.write(key: 'nc_pass', value: p);
+      if (!mounted) return;
+      Navigator.of(context).pushReplacement(
+        MaterialPageRoute(
+          builder: (_) => HomeTabs(api: NextcloudTalkApi(u, p)),
+        ),
+      );
+    });
+  }
+}
+
+class LoginScreen extends StatefulWidget {
+  const LoginScreen({super.key, required this.onLogin});
+  final void Function(String user, String appPassword) onLogin;
+
+  @override
+  State<LoginScreen> createState() => _LoginScreenState();
+}
+
+class _LoginScreenState extends State<LoginScreen> {
+  final _form = GlobalKey<FormState>();
+  final _userCtrl = TextEditingController();
+  final _passCtrl = TextEditingController();
+  bool _loading = false;
+  String? _error;
+
+  Future<void> _submit() async {
+    if (!_form.currentState!.validate()) return;
+    setState(() => _loading = true);
+    final api = NextcloudTalkApi(_userCtrl.text.trim(), _passCtrl.text);
+    try {
+      await api.listRooms(limit: 1);
+      if (!mounted) return;
+      widget.onLogin(api.username, api.appPassword);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _error = e.toString());
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Вход в D_Chat')),
+      body: Center(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 420),
+          child: Padding(
+            padding: const EdgeInsets.all(16.0),
+            child: Form(
+              key: _form,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Text('Введите имя пользователя и пароль\n '),
+                  const SizedBox(height: 16),
+                  TextFormField(
+                    controller: _userCtrl,
+                    decoration: const InputDecoration(
+                      labelText: 'Пользователь',
+                      border: OutlineInputBorder(),
+                    ),
+                    validator: (v) => v == null || v.isEmpty ? 'Введите имя пользователя' : null,
+                  ),
+                  const SizedBox(height: 12),
+                  TextFormField(
+                    controller: _passCtrl,
+                    obscureText: true,
+                    decoration: const InputDecoration(
+                      labelText: 'Пароль ',
+                      border: OutlineInputBorder(),
+                    ),
+                    validator: (v) => v == null || v.isEmpty ? 'Введите пароль' : null,
+                  ),
+                  const SizedBox(height: 16),
+                  if (_error != null) ...[
+                    Text(_error!, style: TextStyle(color: Theme.of(context).colorScheme.error)),
+                    const SizedBox(height: 8),
+                  ],
+                  FilledButton.icon(
+                    onPressed: _loading ? null : _submit,
+                    icon: _loading
+                        ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
+                        : const Icon(Icons.login),
+                    label: const Text('Войти'),
+                  )
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// -------------------- Home Tabs --------------------
+
+class HomeTabs extends StatefulWidget {
+  const HomeTabs({super.key, required this.api});
+  final NextcloudTalkApi api;
+
+  @override
+  State<HomeTabs> createState() => _HomeTabsState();
+}
+
+class _HomeTabsState extends State<HomeTabs> {
+  int _idx = 0;
+
+  @override
+  Widget build(BuildContext context) {
+    final pages = [
+      RoomsScreen(api: widget.api),
+      ContactsScreen(api: widget.api),
+    ];
+
+    return Scaffold(
+      body: IndexedStack(index: _idx, children: pages),
+      bottomNavigationBar: NavigationBar(
+        selectedIndex: _idx,
+        destinations: const [
+          NavigationDestination(icon: Icon(Icons.chat_bubble_outline), label: 'Чаты'),
+          NavigationDestination(icon: Icon(Icons.contacts_outlined), label: 'Контакты'),
+        ],
+        onDestinationSelected: (i) => setState(() => _idx = i),
+      ),
+    );
+  }
+}
+
+// -------------------- Avatars (user & room) --------------------
+
+class NcAvatar {
+  static Widget user({
+    required NextcloudTalkApi api,
+    required String userId,
+    String? displayName,
+    double radius = 20,
+  }) {
+    final safeId = Uri.encodeComponent(userId);
+    final url = '${kNcBase}/index.php/avatar/$safeId/${(radius * 2).round()}';
+    return _NcAvatar(
+      url: url,
+      headers: api.authHeaders,
+      fallbackText: _initial(displayName ?? userId),
+      radius: radius,
+    );
+  }
+
+  static Widget conversation({
+    required NextcloudTalkApi api,
+    required String token,
+    String? displayName,
+    double radius = 20,
+  }) {
+    return _NcRoomAvatar(
+      api: api,
+      token: token,
+      radius: radius,
+      fallbackText: _initial(displayName ?? token),
+    );
+  }
+
+  static String _initial(String s) {
+    final t = s.trim();
+    if (t.isEmpty) return '?';
+    final rune = t.runes.first;
+    return String.fromCharCode(rune).toUpperCase();
+  }
+}
+
+class _NcRoomAvatar extends StatefulWidget {
+  const _NcRoomAvatar({
+    required this.api,
+    required this.token,
+    required this.radius,
+    required this.fallbackText,
+  });
+
+  final NextcloudTalkApi api;
+  final String token;
+  final double radius;
+  final String fallbackText;
+
+  @override
+  State<_NcRoomAvatar> createState() => _NcRoomAvatarState();
+}
+
+class _NcRoomAvatarState extends State<_NcRoomAvatar> {
+  static final Map<String, Uint8List> _cache = {};
+  Uint8List? _bytes;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    final cacheKey = 'room:${widget.token}:${(widget.radius * 2).round()}';
+    if (_cache.containsKey(cacheKey)) {
+      setState(() => _bytes = _cache[cacheKey]);
+      return;
+    }
+    try {
+      final meta = await http.get(
+        Uri.parse('${kNcBase}/ocs/v2.php/apps/spreed/api/v4/room/${widget.token}/avatar?format=json'),
+        headers: {
+          ...widget.api.authHeaders,
+          'OCS-APIRequest': 'true',
+          'Accept': 'application/json',
+        },
+      );
+      if (meta.statusCode == 200) {
+        final j = jsonDecode(meta.body);
+        final rawUrl = (j['ocs']?['data']?['url'] ?? '').toString();
+        if (rawUrl.isNotEmpty) {
+          final fullUrl = rawUrl.startsWith('http')
+              ? rawUrl
+              : (rawUrl.startsWith('/') ? '$kNcBase$rawUrl' : '$kNcBase/$rawUrl');
+          final img = await http.get(Uri.parse(fullUrl), headers: widget.api.authHeaders);
+          if (img.statusCode == 200 && mounted) {
+            _cache[cacheKey] = img.bodyBytes;
+            setState(() => _bytes = img.bodyBytes);
+            return;
+          }
+        }
+      }
+    } catch (_) {
+      // игнор — используем fallback
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_bytes != null) {
+      return CircleAvatar(radius: widget.radius, backgroundImage: MemoryImage(_bytes!));
+    }
+    return CircleAvatar(radius: widget.radius, child: Text(widget.fallbackText));
+  }
+}
+
+class _NcAvatar extends StatefulWidget {
+  const _NcAvatar({
+    required this.url,
+    required this.headers,
+    required this.fallbackText,
+    required this.radius,
+  });
+
+  final String url;
+  final Map<String, String> headers;
+  final String fallbackText;
+  final double radius;
+
+  @override
+  State<_NcAvatar> createState() => _NcAvatarState();
+}
+
+class _NcAvatarState extends State<_NcAvatar> {
+  static final Map<String, Uint8List> _cache = {};
+  Uint8List? _bytes;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    final key = '${widget.url}@${(widget.radius * 2).round()}';
+    if (_cache.containsKey(key)) {
+      setState(() => _bytes = _cache[key]);
+      return;
+    }
+    try {
+      final r = await http.get(Uri.parse(widget.url), headers: widget.headers);
+      if (!mounted) return;
+      if (r.statusCode == 200 && r.bodyBytes.isNotEmpty) {
+        _cache[key] = r.bodyBytes;
+        setState(() => _bytes = r.bodyBytes);
+      }
+    } catch (_) {}
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_bytes != null) {
+      return CircleAvatar(radius: widget.radius, backgroundImage: MemoryImage(_bytes!));
+    }
+    return CircleAvatar(radius: widget.radius, child: Text(widget.fallbackText));
+  }
+}
+
+class RoomAvatar extends StatefulWidget {
+  const RoomAvatar({super.key, required this.api, required this.room, this.radius = 20});
+  final NextcloudTalkApi api;
+  final NcRoom room;
+  final double radius;
+
+  @override
+  State<RoomAvatar> createState() => _RoomAvatarState();
+}
+
+class _RoomAvatarState extends State<RoomAvatar> {
+  static final Map<String, String?> _peerCache = {}; // token -> other userId
+  String? _peerId;
+  String? _peerName;
+
+  @override
+  void initState() {
+    super.initState();
+    _resolvePeer();
+  }
+
+  Future<void> _resolvePeer() async {
+    final cached = _peerCache[widget.room.token];
+    if (cached != null) {
+      _peerId = cached;
+      setState(() {});
+      return;
+    }
+
+    try {
+      final parts = await widget.api.listParticipants(widget.room.token, includeStatus: false);
+      final me = widget.api.username;
+
+      String norm(String s) => s.toLowerCase();
+      final candidates = parts.where((p) {
+        final t = norm(p.actorType);
+        final isUser = t == 'user' || t == 'users' || t == 'federated_users';
+        return isUser && (p.actorId ?? '').isNotEmpty;
+      }).toList();
+
+      final other = candidates.firstWhere(
+        (p) => (p.actorId ?? '') != me,
+        orElse: () => NcParticipant(actorType: 'user', actorId: null, displayName: null),
+      );
+
+      if (!mounted) return;
+      if (other.actorId != null) {
+        _peerId = other.actorId;
+        _peerName = other.displayName ?? other.actorId;
+        _peerCache[widget.room.token] = _peerId;
+        setState(() {});
+        return;
+      }
+    } catch (_) {}
+
+    // Fallback по сообщениям, если участников не нашли
+    try {
+      final page = await widget.api.fetchMessagesPaged(
+        widget.room.token,
+        lookIntoFuture: 0,
+        lastKnownId: null,
+        limit: 30,
+        setReadMarker: 0,
+        markNotificationsAsRead: 0,
+      );
+      final me = widget.api.username;
+      final msgs = page.messages.reversed.toList();
+      final otherMsg = msgs.firstWhere(
+        (m) => (m.actorId ?? '').isNotEmpty && (m.actorId ?? '') != me,
+        orElse: () => NcMessage(id: -1, timestamp: 0),
+      );
+      if (otherMsg.id != -1) {
+        _peerId = otherMsg.actorId;
+        _peerName = otherMsg.actorDisplayName ?? otherMsg.actorId;
+        _peerCache[widget.room.token] = _peerId;
+        if (mounted) setState(() {});
+      }
+    } catch (_) {}
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final name = widget.room.displayName.isEmpty ? widget.room.token : widget.room.displayName;
+
+    if (_peerId != null && _peerId!.isNotEmpty) {
+      return NcAvatar.user(
+        api: widget.api,
+        userId: _peerId!,
+        displayName: _peerName ?? name,
+        radius: widget.radius,
+      );
+    }
+
+    return NcAvatar.conversation(
+      api: widget.api,
+      token: widget.room.token,
+      displayName: name,
+      radius: widget.radius,
+    );
+  }
+}
+
+// -------------------- Rooms (silent refresh) --------------------
+
+class RoomsScreen extends StatefulWidget {
+  const RoomsScreen({super.key, required this.api});
+  final NextcloudTalkApi api;
+
+  @override
+  State<RoomsScreen> createState() => _RoomsScreenState();
+}
+
+class _RoomsScreenState extends State<RoomsScreen> with AutomaticKeepAliveClientMixin {
+  List<NcRoom>? _roomsData; // stale-while-refreshing
+  bool _loading = false;
+  Timer? _ticker;
+
+  @override
+  void initState() {
+    super.initState();
+    _fetchRooms(initial: true);
+    _ticker = Timer.periodic(const Duration(seconds: 15), (_) => _fetchRooms(silent: true));
+  }
+
+  @override
+  void dispose() {
+    _ticker?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _fetchRooms({bool initial = false, bool silent = false}) async {
+    if (_loading) return;
+    if (!mounted) return;
+    setState(() => _loading = !silent && initial && (_roomsData == null));
+    try {
+      final data = await widget.api.listRooms(includeStatus: true);
+      data.sort((a, b) => (b.lastActivity ?? 0).compareTo(a.lastActivity ?? 0));
+      if (!mounted) return;
+      setState(() => _roomsData = data);
+    } catch (_) {
+      // держим старый список
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  Future<void> _refresh() => _fetchRooms();
+
+  @override
+  Widget build(BuildContext context) {
+    super.build(context);
+    final rooms = _roomsData;
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Чаты'),
+        actions: [
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 8),
+            child: _loading && rooms == null
+                ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2))
+                : IconButton(onPressed: _refresh, icon: const Icon(Icons.refresh)),
+          ),
+        ],
+      ),
+      body: rooms == null
+          ? const Center(child: CircularProgressIndicator())
+          : RefreshIndicator(
+              onRefresh: _refresh,
+              child: ListView.separated(
+                physics: const AlwaysScrollableScrollPhysics(),
+                itemCount: rooms.length,
+                separatorBuilder: (_, __) => const Divider(height: 1),
+                itemBuilder: (context, i) {
+                  final r = rooms[i];
+                  final title = r.displayName.isEmpty ? r.token : r.displayName;
+                  return ListTile(
+                    key: ValueKey(r.token), // стабильность при обновлениях
+                    leading: RoomAvatar(api: widget.api, room: r, radius: 20),
+                    title: Text(title),
+                    subtitle: Text(r.lastMessage ?? '', maxLines: 1, overflow: TextOverflow.ellipsis),
+                    onTap: () => Navigator.of(context).push(
+                      MaterialPageRoute(
+                        builder: (_) => ChatScreen(api: widget.api, room: r),
+                      ),
+                    ),
+                  );
+                },
+              ),
+            ),
+    );
+  }
+
+  @override
+  bool get wantKeepAlive => true;
+}
+
+// -------------------- Contacts (silent refresh) --------------------
+
+class ContactItem {
+  ContactItem({
+    required this.userId,
+    required this.displayName,
+    required this.roomToken,
+  });
+
+  final String userId;
+  final String displayName;
+  final String roomToken;
+}
+
+class ContactsScreen extends StatefulWidget {
+  const ContactsScreen({super.key, required this.api});
+  final NextcloudTalkApi api;
+
+  @override
+  State<ContactsScreen> createState() => _ContactsScreenState();
+}
+
+class _ContactsScreenState extends State<ContactsScreen>
+    with AutomaticKeepAliveClientMixin {
+  List<ContactItem>? _contacts; // последний успешный срез
+  bool _loading = false;
+  Timer? _ticker;
+
+  @override
+  void initState() {
+    super.initState();
+    _fetch(initial: true);
+    _ticker = Timer.periodic(const Duration(seconds: 30), (_) => _fetch(silent: true));
+  }
+
+  @override
+  void dispose() {
+    _ticker?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _fetch({bool initial = false, bool silent = false}) async {
+    if (_loading) return;
+    if (!mounted) return;
+    setState(() => _loading = !silent && initial && (_contacts == null));
+    try {
+      final data = await _loadContacts();
+      if (!mounted) return;
+      setState(() => _contacts = data);
+    } catch (_) {
+      // оставляем предыдущий список (тихий фейл)
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  Future<List<ContactItem>> _loadContacts() async {
+    final rooms = await widget.api.listRooms(includeStatus: true);
+    final me = widget.api.username;
+    final oneToOne = rooms.where((r) => r.type == 1).toList();
+
+    final out = <ContactItem>[];
+    for (final r in oneToOne) {
+      try {
+        final parts = await widget.api.listParticipants(r.token, includeStatus: true);
+        final other = parts.firstWhere(
+          (p) =>
+              (p.actorType.toLowerCase() == 'user' ||
+               p.actorType.toLowerCase() == 'users' ||
+               p.actorType.toLowerCase() == 'federated_users') &&
+              (p.actorId ?? '') != me,
+          orElse: () => NcParticipant(actorType: 'users', actorId: r.displayName, displayName: r.displayName),
+        );
+        out.add(ContactItem(
+          userId: other.actorId ?? r.displayName,
+          displayName: (other.displayName?.isNotEmpty ?? false) ? other.displayName! : (other.actorId ?? r.displayName),
+          roomToken: r.token,
+        ));
+      } catch (_) {
+        out.add(ContactItem(
+          userId: r.displayName,
+          displayName: r.displayName,
+          roomToken: r.token,
+        ));
+      }
+    }
+
+    out.sort((a, b) => a.displayName.toLowerCase().compareTo(b.displayName.toLowerCase()));
+    return out;
+  }
+
+  Future<void> _refresh() => _fetch();
+
+  Future<void> _startChat(ContactItem c) async {
+    try {
+      final room = NcRoom(token: c.roomToken, displayName: c.displayName, type: 1);
+      if (!mounted) return;
+      await Navigator.of(context).push(
+        MaterialPageRoute(builder: (_) => ChatScreen(api: widget.api, room: room)),
+      );
+      _fetch(silent: true);
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Не удалось начать чат: $e')));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    super.build(context);
+    final contacts = _contacts;
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Контакты'),
+        actions: [
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 8),
+            child: _loading && contacts == null
+                ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2))
+                : IconButton(onPressed: _refresh, icon: const Icon(Icons.refresh)),
+          ),
+        ],
+      ),
+      body: contacts == null
+          ? const Center(child: CircularProgressIndicator())
+          : RefreshIndicator(
+              onRefresh: _refresh,
+              child: ListView.separated(
+                physics: const AlwaysScrollableScrollPhysics(),
+                itemCount: contacts.length,
+                separatorBuilder: (_, __) => const Divider(height: 1),
+                itemBuilder: (context, i) {
+                  final c = contacts[i];
+                  return ListTile(
+                    key: ValueKey(c.roomToken),
+                    leading: NcAvatar.user(
+                      api: widget.api,
+                      userId: c.userId,
+                      displayName: c.displayName,
+                      radius: 20,
+                    ),
+                    title: Text(c.displayName),
+                    trailing: IconButton(
+                      icon: const Icon(Icons.textsms_outlined),
+                      tooltip: 'Начать переписку',
+                      onPressed: () => _startChat(c),
+                    ),
+                    onTap: () => _startChat(c),
+                  );
+                },
+              ),
+            ),
+    );
+  }
+
+  @override
+  bool get wantKeepAlive => true;
+}
+
+// -------------------- Playback hub --------------------
+
+class PlaybackHub {
+  static final _audioPlayers = <AudioPlayer>{};
+  static final _videoCtrls = <VideoPlayerController>{};
+
+  static void registerAudio(AudioPlayer p) => _audioPlayers.add(p);
+  static void unregisterAudio(AudioPlayer p) => _audioPlayers.remove(p);
+
+  static void registerVideo(VideoPlayerController c) => _videoCtrls.add(c);
+  static void unregisterVideo(VideoPlayerController c) => _videoCtrls.remove(c);
+
+  static Future<void> pauseAll() async {
+    for (final p in _audioPlayers) {
+      if (p.playing) {
+        try { await p.pause(); } catch (_) {}
+      }
+    }
+    for (final v in _videoCtrls) {
+      try { await v.pause(); } catch (_) {}
+    }
+  }
+}
+
+// -------------------- Chat --------------------
+
+class ChatScreen extends StatefulWidget {
+  const ChatScreen({super.key, required this.api, required this.room});
+  final NextcloudTalkApi api;
+  final NcRoom room;
+
+  @override
+  State<ChatScreen> createState() => _ChatScreenState();
+}
+
+class _ChatScreenState extends State<ChatScreen> {
+  final _scroll = ScrollController();
+  final _input = TextEditingController();
+  final _inputFocus = FocusNode();
+  final _recorder = AudioRecorder();
+
+  final Map<int, double> _itemHeights = {};
+  final Map<int, int> _idToIndex = {};
+  final Map<int, String> _myReactions = {};
+  final Map<int, GlobalKey> _msgKeys = {};
+
+  double _inputBarHeight = 56;
+  double _replyBarHeight = 0.0;     // NEW
+  double _recordBarHeight = 0.0;    // NEW
+
+  List<NcMessage> _messages = [];
+  bool _loading = false;
+  bool _loadingOlder = false;
+  int? _lastKnownIdNewer;
+  int? _olderPageOffsetId;
+  Timer? _poll;
+  bool _isRecording = false;
+  String? _recordError;
+  String? _currentRecPath;
+
+  bool _showDownBtn = false;
+
+  StreamSubscription<Amplitude>? _ampSub;
+  double _recAmp = 0.0;
+
+  NcMessage? _replyTarget;
+  bool _scrolledToEndOnce = false;
+
+  bool _mapEquals<K, V>(Map<K, V> a, Map<K, V> b) {
+    if (identical(a, b)) return true;
+    if (a.length != b.length) return false;
+    for (final K k in a.keys) {
+      if (!b.containsKey(k) || a[k] != b[k]) return false;
+    }
+    return true;
+  }
+
+  /// Обновляет реакции и reactionsSelf у уже известных сообщений.
+  /// Возвращает true, если что-то реально поменялось.
+  bool _patchReactionsFromServer(Iterable<NcMessage> incoming) {
+    if (_messages.isEmpty) return false;
+
+    // id -> index для быстрого доступа
+    final idxById = <int, int>{};
+    for (var i = 0; i < _messages.length; i++) {
+      idxById[_messages[i].id] = i;
+    }
+
+    var changed = false;
+    for (final srv in incoming) {
+      final i = idxById[srv.id];
+      if (i == null) continue; // это не тот диапазон, который у нас виден
+      final local = _messages[i];
+
+      // Сравниваем именно реакции (карта + self)
+      final sameMap = _mapEquals(local.reactions, srv.reactions);
+      final sameSelf = local.reactionsSelf.length == srv.reactionsSelf.length &&
+          local.reactionsSelf.toSet().containsAll(srv.reactionsSelf);
+
+      if (!sameMap || !sameSelf) {
+        // Создаём новый объект с теми же полями, но обновлёнными реакциями
+        _messages[i] = NcMessage(
+          id: local.id,
+          actorId: local.actorId,
+          actorDisplayName: local.actorDisplayName,
+          message: local.message,
+          timestamp: local.timestamp,
+          isFile: local.isFile,
+          filePath: local.filePath,
+          fileId: local.fileId,
+          fileMime: local.fileMime,
+          messageType: local.messageType,
+          isSystemLike: local.isSystemLike,
+          parentId: local.parentId,
+          parentAuthor: local.parentAuthor,
+          parentText: local.parentText,
+          parentIsFile: local.parentIsFile,
+          parentFileName: local.parentFileName,
+          reactions: Map<String, int>.from(srv.reactions),
+          reactionsSelf: List<String>.from(srv.reactionsSelf),
+        );
+        changed = true;
+      }
+    }
+    return changed;
+  }
+
+
+
+  @override
+  void initState() {
+    super.initState();
+
+    () async {
+      final cached = await TalkCache.loadTail(widget.room.token);
+      if (mounted && cached != null && cached.isNotEmpty) {
+        setState(() {
+          _messages = _mergeAndSort(_messages, cached);
+          _idToIndex
+            ..clear()
+            ..addEntries(_visibleMessages.asMap().entries.map((e) => MapEntry(e.value.id, e.key)));
+        });
+        WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
+        _scrolledToEndOnce = true;
+      }
+      await _load(initial: true);
+    }();
+
+    _poll = Timer.periodic(const Duration(seconds: 3), (_) => _load());
+    _scroll.addListener(_onScroll);
+  }
+
+  void _onScroll() {
+    if (!_scroll.hasClients) return;
+    final farFromBottom = _scroll.position.maxScrollExtent - _scroll.position.pixels > 200;
+    if (_showDownBtn != farFromBottom && mounted) {
+      setState(() => _showDownBtn = farFromBottom);
+    }
+    if (_scroll.position.pixels <= 48 && !_loadingOlder) {
+      _loadOlder();
+    }
+  }
+
+  @override
+  void dispose() {
+    _poll?.cancel();
+    _scroll.removeListener(_onScroll);
+    _scroll.dispose();
+    _input.dispose();
+    _inputFocus.dispose();
+    _ampSub?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _load({bool initial = false}) async {
+    if (_loading) return;
+    if (!mounted) return;
+    setState(() => _loading = true);
+    try {
+      final page = await widget.api.fetchMessagesPaged(
+        widget.room.token,
+        lookIntoFuture: initial ? 0 : 1,
+        lastKnownId: _lastKnownIdNewer,
+        limit: initial ? 60 : 120,
+        setReadMarker: 0,
+        markNotificationsAsRead: 0,
+      );
+      if (!mounted) return;
+      final res = page.messages;
+      if (res.isNotEmpty) {
+        // 1) как и раньше — мерджим новые/обновлённые сообщения (текст/файлы)
+        setState(() {
+          _messages = _mergeAndSort(_messages, res);
+          _idToIndex
+            ..clear()
+            ..addEntries(_visibleMessages.asMap().entries.map((e) => MapEntry(e.value.id, e.key)));
+          _lastKnownIdNewer = _messages.isNotEmpty ? _messages.last.id : _lastKnownIdNewer;
+          _olderPageOffsetId ??= page.lastGiven;
+          for (final m in _messages) {
+            if (m.reactionsSelf.isNotEmpty) {
+              _myReactions[m.id] = m.reactionsSelf.first;
+            } else {
+              _myReactions.remove(m.id);
+            }
+          }
+        });
+
+        // 2) ДОБАВЬТЕ: точечная синхронизация реакций (быстро, без переразметки всего)
+        final patched = _patchReactionsFromServer(res);
+        if (patched && mounted) {
+          setState(() {}); // перерисуем только "грязные" карточки по ключам
+        }
+
+        if (initial && !_scrolledToEndOnce) {
+          _scrolledToEndOnce = true;
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (_scroll.hasClients) _scroll.jumpTo(_scroll.position.maxScrollExtent);
+          });
+        }
+
+        await TalkCache.saveTailWithMedia(widget.api, widget.room.token, _messages);
+      }
+
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Ошибка загрузки сообщений: $e')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  Future<void> _loadOlder() async {
+    if (_loadingOlder) return;
+    if (_olderPageOffsetId == null) return;
+    setState(() => _loadingOlder = true);
+    final anchorId = _visibleMessages.isNotEmpty ? _visibleMessages.first.id : null;
+
+    try {
+      final page = await widget.api.fetchMessagesPaged(
+        widget.room.token,
+        lookIntoFuture: 0,
+        lastKnownId: _olderPageOffsetId,
+        limit: 100,
+        setReadMarker: 0,
+        markNotificationsAsRead: 0,
+      );
+      if (!mounted) return;
+
+      if (page.messages.isNotEmpty) {
+        setState(() {
+          _messages = _mergeAndSort(_messages, page.messages);
+          _idToIndex
+            ..clear()
+            ..addEntries(_visibleMessages.asMap().entries.map((e) => MapEntry(e.value.id, e.key)));
+          _olderPageOffsetId = page.lastGiven;
+        });
+
+        if (anchorId != null) {
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            _scrollToMessageById(anchorId, jump: true);
+          });
+        }
+        await TalkCache.saveTailWithMedia(widget.api, widget.room.token, _messages);
+      } else {
+        _olderPageOffsetId = page.lastGiven ?? _olderPageOffsetId;
+      }
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('История: $e')));
+    } finally {
+      if (mounted) setState(() => _loadingOlder = false);
+    }
+  }
+
+  Future<bool> _loadOlderForTarget() async {
+    if (_olderPageOffsetId == null || _loadingOlder) return false;
+    setState(() => _loadingOlder = true);
+    final anchorId = _visibleMessages.isNotEmpty ? _visibleMessages.first.id : null;
+    try {
+      final page = await widget.api.fetchMessagesPaged(
+        widget.room.token,
+        lookIntoFuture: 0,
+        lastKnownId: _olderPageOffsetId,
+        limit: 120,
+        setReadMarker: 0,
+        markNotificationsAsRead: 0,
+      );
+      if (!mounted) return false;
+      if (page.messages.isNotEmpty) {
+        setState(() {
+          _messages = _mergeAndSort(_messages, page.messages);
+          _idToIndex
+            ..clear()
+            ..addEntries(_visibleMessages.asMap().entries.map((e) => MapEntry(e.value.id, e.key)));
+          _olderPageOffsetId = page.lastGiven;
+        });
+        if (anchorId != null) {
+          WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToMessageById(anchorId, jump: true));
+        }
+        await TalkCache.saveTailWithMedia(widget.api, widget.room.token, _messages);
+        return true;
+      } else {
+        _olderPageOffsetId = page.lastGiven ?? _olderPageOffsetId;
+        return false;
+      }
+    } catch (_) {
+      return false;
+    } finally {
+      if (mounted) setState(() => _loadingOlder = false);
+    }
+  }
+
+  List<NcMessage> _mergeAndSort(List<NcMessage> a, List<NcMessage> b) {
+    final map = {for (final m in a) m.id: m};
+    for (final m in b) {
+      map[m.id] = m;
+    }
+    final list = map.values.toList()
+      ..sort((x, y) => x.timestamp.compareTo(y.timestamp));
+    return list;
+  }
+
+  List<NcMessage> get _visibleMessages =>
+      _messages.where((m) => !m.isSystemLike).toList(growable: false);
+
+  Future<void> _sendText() async {
+    final text = _input.text.trim();
+    if (text.isEmpty) return;
+    final replyId = _replyTarget?.id;
+    _input.clear();
+    setState(() => _replyTarget = null);
+    try {
+      await widget.api.sendMessage(widget.room.token, text, replyTo: replyId);
+      await _load();
+      _scrollToBottom();
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Не удалось отправить: $e')),
+        );
+      }
+    }
+  }
+
+  Future<void> _sendPickedFile(File file, {String? overrideName}) async {
+    try {
+      final replyId = _replyTarget?.id;
+      setState(() => _replyTarget = null);
+      await widget.api.sendFileToChat(
+        widget.room.token,
+        file,
+        overrideName: overrideName,
+        replyTo: replyId,
+      );
+      await _load();
+      _scrollToBottom();
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Не удалось отправить файл: $e')),
+        );
+      }
+    }
+  }
+
+  Future<void> _sendVoiceFile(File file) async {
+    try {
+      final replyId = _replyTarget?.id;
+      setState(() => _replyTarget = null);
+      await widget.api.sendFileToChat(
+        widget.room.token,
+        file,
+        overrideName: 'voice_${DateTime.now().millisecondsSinceEpoch}.m4a',
+        replyTo: replyId,
+        messageType: 'voice-message',
+      );
+      await _load();
+      _scrollToBottom();
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Не удалось отправить голосовое: $e')),
+        );
+      }
+    }
+  }
+
+  Future<void> _pickFromGallery({required bool image, required bool video}) async {
+    final picker = ImagePicker();
+    final source = ImageSource.gallery;
+    if (image && !video) {
+      final x = await picker.pickImage(source: source, maxWidth: 4096, maxHeight: 4096);
+      if (x != null) await _sendPickedFile(File(x.path));
+    } else if (!image && video) {
+      final x = await picker.pickVideo(source: source, maxDuration: const Duration(minutes: 10));
+      if (x != null) await _sendPickedFile(File(x.path));
+    }
+  }
+
+  Future<void> _captureCamera({required bool image, required bool video}) async {
+    final picker = ImagePicker();
+    final source = ImageSource.camera;
+    if (image && !video) {
+      final x = await picker.pickImage(source: source, imageQuality: 90, maxWidth: 4096, maxHeight: 4096);
+      if (x != null) await _sendPickedFile(File(x.path));
+    } else if (!image && video) {
+      final x = await picker.pickVideo(source: source, maxDuration: const Duration(minutes: 5));
+      if (x != null) await _sendPickedFile(File(x.path));
+    }
+  }
+
+  Future<void> _pickAnyFile() async {
+    final res = await FilePicker.platform.pickFiles(allowMultiple: false);
+    if (res != null && res.files.single.path != null) {
+      await _sendPickedFile(File(res.files.single.path!), overrideName: res.files.single.name);
+    }
+  }
+
+  Future<void> _toggleRecord() async {
+    if (_isRecording) {
+      try {
+        final path = await _recorder.stop();
+        _ampSub?.cancel();
+        _recAmp = 0.0;
+        if (!mounted) return;
+        setState(() => _isRecording = false);
+        final f = path ?? _currentRecPath;
+        _currentRecPath = null;
+        if (f != null) {
+          await _sendVoiceFile(File(f));
+        }
+      } catch (e) {
+        if (!mounted) return;
+        setState(() => _recordError = e.toString());
+      }
+      return;
+    }
+
+    try {
+      _recordError = null;
+      final ok = await _recorder.hasPermission();
+      if (!mounted) return;
+      if (!ok) {
+        setState(() => _recordError = 'Нет разрешения на запись');
+        return;
+      }
+
+      await PlaybackHub.pauseAll();
+      await Future.delayed(const Duration(milliseconds: 200));
+
+      final dir = Directory.systemTemp.path;
+      final fpath = p.join(dir, 'rec_${DateTime.now().millisecondsSinceEpoch}.m4a');
+      _currentRecPath = fpath;
+
+      final cfg = const RecordConfig(
+        encoder: AudioEncoder.aacLc,
+        bitRate: 128000,
+        sampleRate: 44100,
+        numChannels: 1,
+      );
+
+      await _recorder.start(cfg, path: fpath);
+      _ampSub?.cancel();
+      _ampSub = _recorder.onAmplitudeChanged(const Duration(milliseconds: 80)).listen((a) {
+        final db = a.current;
+        double level = (db + 45.0) / 45.0;
+        level = level.clamp(0.0, 1.0);
+        if (mounted) setState(() => _recAmp = level);
+      });
+      if (!mounted) return;
+      setState(() => _isRecording = true);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _recordError = e.toString());
+    }
+  }
+
+  Future<void> _cancelRecord() async {
+    try {
+      final path = await _recorder.stop();
+      _ampSub?.cancel();
+      _recAmp = 0.0;
+      final f = path ?? _currentRecPath;
+      _currentRecPath = null;
+      if (f != null) {
+        final file = File(f);
+        if (await file.exists()) {
+          await file.delete();
+        }
+      }
+    } catch (_) {}
+    if (mounted) setState(() => _isRecording = false);
+  }
+
+  void _openAttachSheet() {
+    showModalBottomSheet(
+      context: context,
+      showDragHandle: true,
+      builder: (context) {
+        return SafeArea(
+          child: Wrap(
+            children: [
+              _attachTile(Icons.image_outlined, 'Фото из галереи', () {
+                Navigator.pop(context);
+                _pickFromGallery(image: true, video: false);
+              }),
+              _attachTile(Icons.photo_camera_outlined, 'Сделать фото', () {
+                Navigator.pop(context);
+                _captureCamera(image: true, video: false);
+              }),
+              _attachTile(Icons.videocam_outlined, 'Видео из галереи', () {
+                Navigator.pop(context);
+                _pickFromGallery(image: false, video: true);
+              }),
+              _attachTile(Icons.videocam, 'Снять видео', () {
+                Navigator.pop(context);
+                _captureCamera(image: false, video: true);
+              }),
+              _attachTile(Icons.attach_file, 'Файл', () {
+                Navigator.pop(context);
+                _pickAnyFile();
+              }),
+              ListTile(
+                leading: Icon(_isRecording ? Icons.stop_circle : Icons.mic_none),
+                title: Text(_isRecording ? 'Остановить запись' : 'Голосовое сообщение'),
+                onTap: () {
+                  Navigator.pop(context);
+                  _toggleRecord();
+                },
+                subtitle: _recordError != null ? Text(_recordError!, style: const TextStyle(color: Colors.red)) : null,
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  ListTile _attachTile(IconData icon, String title, VoidCallback onTap) {
+    return ListTile(leading: Icon(icon), title: Text(title), onTap: onTap);
+  }
+
+  Future<void> _openImageViewer(int startIndex, List<_ImageItem> items) async {
+    final result = await Navigator.of(context).push(
+      PageRouteBuilder(
+        opaque: false,
+        barrierColor: Colors.transparent,
+        pageBuilder: (_, __, ___) => ImageViewerPage(
+          api: widget.api,
+          roomToken: widget.room.token,
+          items: items,
+          startIndex: startIndex,
+          headers: widget.api.authHeaders,
+          myReactions: Map<int, String>.from(_myReactions),
+          onReactionChanged: (messageId, emojiOrNull) {
+            setState(() {
+              if (emojiOrNull == null) {
+                _myReactions.remove(messageId);
+              } else {
+                _myReactions[messageId] = emojiOrNull;
+              }
+            });
+          },
+          loadMoreBefore: () async {
+            final beforeLen = items.length;
+            final got = await _loadOlderForTarget();
+            if (got) {
+              items
+                ..clear()
+                ..addAll(_visibleMessages
+                    .where((m) => m.isFile && (m.fileMime?.startsWith('image/') ?? false) && m.filePath != null)
+                    .map((m) => _ImageItem(
+                          url: widget.api.webdavFileUrl(m.filePath!),
+                          name: p.basename(m.filePath!),
+                          messageId: m.id,
+                        )));
+            }
+            return items.length - beforeLen;
+          },
+        ),
+        transitionsBuilder: (_, anim, __, child) => FadeTransition(opacity: anim, child: child),
+      ),
+    );
+    if (result is int) {
+      await _scrollToMessageEnsureLoaded(result);
+    }
+  }
+
+  double _estimateOffsetForIndex(int targetIndex) {
+    double offset = 0;
+    final visible = _visibleMessages;
+    for (int i = 0; i < targetIndex && i < visible.length; i++) {
+      final id = visible[i].id;
+      offset += _itemHeights[id] ?? 80.0;
+    }
+    return offset;
+  }
+
+  double _extraBottomPadding() {
+    final pad = MediaQuery.of(context).padding.bottom;
+    return _inputBarHeight + _replyBarHeight + _recordBarHeight + pad;
+  }
+
+
+  double? _offsetToStickBottom(GlobalKey key) {
+    if (!_scroll.hasClients) return null;
+    final ctx = key.currentContext;
+    final render = ctx?.findRenderObject();
+    if (render == null) return null;
+
+    final viewport = RenderAbstractViewport.of(render);
+    if (viewport == null) return null;
+
+    final reveal = viewport.getOffsetToReveal(render, 1.0).offset;
+    final correction = _extraBottomPadding();
+    final target = (reveal - correction)
+        .clamp(0.0, _scroll.position.maxScrollExtent)
+        .toDouble();
+    return target;
+  }
+
+  Future<void> _stickMessageAtInput(int messageId, {bool jump = false}) async {
+    final key = _msgKeys[messageId];
+    if (key == null) return;
+    double? off = _offsetToStickBottom(key);
+    if (off == null) return;
+
+    if (jump) {
+      _scroll.jumpTo(off);
+    } else {
+      await _scroll.animateTo(off, duration: const Duration(milliseconds: 280), curve: Curves.easeOut);
+    }
+    for (int i = 0; i < 2; i++) {
+      await Future.delayed(const Duration(milliseconds: 60));
+      off = _offsetToStickBottom(key);
+      if (off != null) _scroll.jumpTo(off);
+    }
+  }
+
+  Future<void> _scrollToMessageEnsureLoaded(int messageId) async {
+    int guard = 0;
+    while (!_idToIndex.containsKey(messageId) && _olderPageOffsetId != null && guard < 25) {
+      final got = await _loadOlderForTarget();
+      if (!got) break;
+      guard++;
+    }
+    if (_idToIndex.containsKey(messageId)) {
+      await _stickMessageAtInput(messageId, jump: true);
+    }
+  }
+
+  void _scrollToMessageById(int messageId, {bool jump = false}) {
+    final targetIndex = _idToIndex[messageId];
+    if (targetIndex == null || !_scroll.hasClients) return;
+    final offset = _estimateOffsetForIndex(targetIndex).clamp(0.0, _scroll.position.maxScrollExtent).toDouble();
+    if (jump) {
+      _scroll.jumpTo(offset);
+    } else {
+      _scroll.animateTo(offset, duration: const Duration(milliseconds: 300), curve: Curves.easeOut);
+    }
+  }
+
+  bool _isKeyboardVisible() => MediaQuery.of(context).viewInsets.bottom > 0;
+
+  void _scrollToBottom() {
+    if (!_scroll.hasClients) return;
+    void go() {
+      if (!_scroll.hasClients) return;
+      final target = _scroll.position.maxScrollExtent;
+      _scroll.animateTo(
+        target,
+        duration: const Duration(milliseconds: 280),
+        curve: Curves.easeOutCubic,
+      );
+    }
+    go();
+    WidgetsBinding.instance.addPostFrameCallback((_) => go());
+  }
+
+  Future<void> _showEditAgeDialog() async {
+    await showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Редактирование недоступно'),
+        content: const Text('Сообщение можно редактировать только в течение 6 часов после отправки.'),
+        actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Понятно'))],
+      ),
+    );
+  }
+
+  void _openMessageMenu(NcMessage m) async {
+    final me = widget.api.username;
+    final canEdit = !m.isFile && (m.actorId == me);
+    final canDelete = (m.actorId == me);
+    final hasText = (m.message?.isNotEmpty ?? false);
+
+    await showModalBottomSheet(
+      context: context,
+      showDragHandle: true,
+      builder: (ctx) {
+        return SafeArea(
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            ListTile(
+              leading: const Icon(Icons.reply_outlined),
+              title: const Text('Ответить'),
+              onTap: () {
+                Navigator.pop(ctx);
+                setState(() => _replyTarget = m);
+                FocusScope.of(context).requestFocus(_inputFocus);
+                HapticFeedback.mediumImpact();
+              },
+            ),
+            if (canEdit)
+              ListTile(
+                leading: const Icon(Icons.edit_outlined),
+                title: const Text('Редактировать'),
+                onTap: () async {
+                  Navigator.pop(ctx);
+                  final nowSec = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+                  if (nowSec - m.timestamp >= 6 * 3600) {
+                    await _showEditAgeDialog();
+                  } else {
+                    _openEditDialog(m);
+                  }
+                },
+              ),
+            if (hasText)
+              ListTile(
+                leading: const Icon(Icons.copy_all_outlined),
+                title: const Text('Скопировать текст'),
+                onTap: () async {
+                  await Clipboard.setData(ClipboardData(text: m.message ?? ''));
+                  if (mounted) {
+                    Navigator.pop(ctx);
+                    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Скопировано')));
+                  }
+                },
+              ),
+            ListTile(
+              leading: const Icon(Icons.forward_outlined),
+              title: const Text('Переслать в другой чат'),
+              onTap: () {
+                Navigator.pop(ctx);
+                _openForwardSheet(m);
+              },
+            ),
+            if (canDelete)
+              ListTile(
+                leading: const Icon(Icons.delete_outline, color: Colors.red),
+                title: const Text('Удалить', style: TextStyle(color: Colors.red)),
+                onTap: () async {
+                  Navigator.pop(ctx);
+                  try {
+                    await widget.api.deleteMessage(widget.room.token, m.id);
+                    setState(() {
+                      _messages.removeWhere((x) => x.id == m.id);
+                      _idToIndex.remove(m.id);
+                    });
+                  } catch (e) {
+                    if (!mounted) return;
+                    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Не удалось удалить: $e')));
+                  }
+                },
+              ),
+          ]),
+        );
+      },
+    );
+  }
+
+  void _openEditDialog(NcMessage m) {
+    final ctrl = TextEditingController(text: m.message ?? '');
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Редактировать сообщение'),
+        content: TextField(
+          controller: ctrl,
+          maxLines: null,
+          decoration: const InputDecoration(border: OutlineInputBorder()),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Отмена')),
+          FilledButton(
+            onPressed: () async {
+              final newText = ctrl.text.trim();
+              Navigator.pop(ctx);
+              try {
+                await widget.api.editMessage(widget.room.token, m.id, newText);
+                await _load();
+              } catch (e) {
+                final s = e.toString();
+                if (s.contains('"error":"age"') || s.contains('error":"age') || s.contains('age"')) {
+                  await _showEditAgeDialog();
+                } else {
+                  if (!mounted) return;
+                  ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Не удалось редактировать: $e')));
+                }
+              }
+            },
+            child: const Text('Сохранить'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _openForwardSheet(NcMessage m) async {
+    final rooms = await widget.api.listRooms();
+    if (!mounted) return;
+    showModalBottomSheet(
+      context: context,
+      showDragHandle: true,
+      builder: (ctx) {
+        return SafeArea(
+          child: ListView(
+            shrinkWrap: true,
+            children: [
+              const ListTile(title: Text('Выберите чат')),
+              for (final r in rooms.where((r) => r.token != widget.room.token))
+                ListTile(
+                  leading: const Icon(Icons.chat_outlined),
+                  title: Text(r.displayName.isEmpty ? r.token : r.displayName),
+                  onTap: () async {
+                    Navigator.pop(ctx);
+                    try {
+                      if (m.isFile && m.filePath != null) {
+                        await widget.api.shareExistingFileToChat(r.token, m.filePath!);
+                      } else if ((m.message?.isNotEmpty ?? false)) {
+                        await widget.api.sendMessage(r.token, m.message!);
+                      } else {
+                        throw 'Пустое сообщение';
+                      }
+                      if (mounted) {
+                        ScaffoldMessenger.of(context)
+                            .showSnackBar(const SnackBar(content: Text('Переслано')));
+                      }
+                    } catch (e) {
+                      if (!mounted) return;
+                      ScaffoldMessenger.of(context)
+                          .showSnackBar(SnackBar(content: Text('Не удалось переслать: $e')));
+                    }
+                  },
+                ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final dateFmt = DateFormat('dd.MM.yyyy HH:mm');
+    final me = widget.api.username;
+
+    final msgs = _visibleMessages;
+
+    final imageItems = <_ImageItem>[];
+    for (final m in msgs) {
+      final isImg = m.isFile && (m.fileMime?.startsWith('image/') ?? false);
+      if (isImg && m.filePath != null) {
+        imageItems.add(_ImageItem(
+          url: widget.api.webdavFileUrl(m.filePath!),
+          name: p.basename(m.filePath!),
+          messageId: m.id,
+        ));
+      }
+    }
+
+    final titleText = widget.room.displayName.isEmpty ? widget.room.token : widget.room.displayName;
+
+    return Scaffold(
+      appBar: AppBar(
+        titleSpacing: 0,
+        title: Row(
+          children: [
+            RoomAvatar(api: widget.api, room: widget.room, radius: 16),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Text(
+                titleText,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+          ],
+        ),
+      ),
+      body: Stack(
+        children: [
+          Column(
+            children: [
+              Expanded(
+                child: NotificationListener<ScrollUpdateNotification>(
+                  onNotification: (n) {
+                    if (n.dragDetails != null && (n.scrollDelta ?? 0) < 0 && _isKeyboardVisible()) {
+                      FocusScope.of(context).unfocus();
+                    }
+                    return false;
+                  },
+                  child: ListView.builder(
+                    controller: _scroll,
+                    itemCount: msgs.length,
+                    itemBuilder: (context, i) {
+                      final m = msgs[i];
+                      final isMe = (m.actorId == me);
+
+                      int? imageIndex;
+                      if (m.isFile && (m.fileMime?.startsWith('image/') ?? false) && m.filePath != null) {
+                        final url = widget.api.webdavFileUrl(m.filePath!);
+                        imageIndex = imageItems.indexWhere((e) => e.url == url && e.messageId == m.id);
+                      }
+
+                      final author = m.actorDisplayName ?? m.actorId ?? 'User';
+                      final bubble = Card(
+                        color: isMe ? Theme.of(context).colorScheme.primaryContainer : null,
+                        margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                        child: Padding(
+                          padding: const EdgeInsets.all(10),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  if (!isMe)
+                                    Padding(
+                                      padding: const EdgeInsets.only(right: 8),
+                                      child: NcAvatar.user(
+                                        api: widget.api,
+                                        userId: m.actorId ?? author,
+                                        displayName: author,
+                                        radius: 10,
+                                      ),
+                                    ),
+                                  Text(author, style: const TextStyle(fontWeight: FontWeight.w600)),
+                                ],
+                              ),
+                              const SizedBox(height: 6),
+                              if (m.parentId != null)
+                                _ReplyMini(
+                                  author: m.parentAuthor ?? 'Сообщение',
+                                  snippet: m.parentIsFile
+                                      ? (m.parentFileName ?? 'Вложение')
+                                      : (m.parentText ?? ''),
+                                  isFile: m.parentIsFile,
+                                  onTap: () => _scrollToMessageEnsureLoaded(m.parentId!),
+                                ),
+                              if (m.isFile)
+                                FileBubble(
+                                  api: widget.api,
+                                  filePath: m.filePath!,
+                                  mimeType: m.fileMime ?? lookupMimeType(m.filePath!) ?? 'application/octet-stream',
+                                  onOpenImage: imageIndex != null
+                                      ? () => _openImageViewer(imageIndex!, imageItems)
+                                      : null,
+                                )
+                              else
+                                SelectableText(
+                                  m.message ?? '',
+                                  enableInteractiveSelection: false,
+                                ),
+                              const SizedBox(height: 6),
+                              Text(
+                                dateFmt.format(DateTime.fromMillisecondsSinceEpoch(m.timestamp * 1000)),
+                                style: Theme.of(context).textTheme.labelSmall,
+                              ),
+                              if (m.reactions.isNotEmpty)
+                                Padding(
+                                  padding: const EdgeInsets.only(top: 6),
+                                  child: Wrap(
+                                    spacing: 6,
+                                    runSpacing: 4,
+                                    children: [
+                                      for (final entry in m.reactions.entries)
+                                        GestureDetector(
+                                          onTap: () async {
+                                            final emoji = entry.key;
+                                            final mine = m.reactionsSelf.contains(emoji);
+                                            try {
+                                              if (mine) {
+                                                await widget.api.deleteReaction(widget.room.token, m.id, emoji);
+                                                setState(() {
+                                                  m.reactionsSelf.remove(emoji);
+                                                  final c = m.reactions[emoji] ?? 1;
+                                                  if (c <= 1) {
+                                                    m.reactions.remove(emoji);
+                                                  } else {
+                                                    m.reactions[emoji] = c - 1;
+                                                  }
+                                                });
+                                              } else {
+                                                await widget.api.addReaction(widget.room.token, m.id, emoji);
+                                                setState(() {
+                                                  m.reactionsSelf.add(emoji);
+                                                  m.reactions[emoji] = (m.reactions[emoji] ?? 0) + 1;
+                                                });
+                                              }
+
+                                              // 👇 ДОБАВИТЬ: подгрузка с задержкой, чтобы синхронизироваться с сервером
+                                              Future.delayed(const Duration(seconds: 2), () {
+                                                if (mounted) _load();
+                                              });
+                                            } catch (e) {
+                                              if (!mounted) return;
+                                              ScaffoldMessenger.of(context).showSnackBar(
+                                                SnackBar(content: Text('Реакция: $e')),
+                                              );
+                                            }
+                                          },
+
+                                          child: Container(
+                                            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                                            decoration: BoxDecoration(
+                                              color: m.reactionsSelf.contains(entry.key)
+                                                  ? Theme.of(context).colorScheme.primary.withOpacity(0.18)
+                                                  : Theme.of(context).colorScheme.surfaceVariant.withOpacity(0.6),
+                                              borderRadius: BorderRadius.circular(16),
+                                            ),
+                                            child: Row(mainAxisSize: MainAxisSize.min, children: [
+                                              Text(entry.key, style: const TextStyle(fontSize: 16)),
+                                              const SizedBox(width: 6),
+                                              Text('${entry.value}',
+                                                  style: Theme.of(context).textTheme.labelMedium),
+                                            ]),
+                                          ),
+                                        ),
+                                    ],
+                                  ),
+                                ),
+                            ],
+                          ),
+                        ),
+                      );
+
+                      final key = _msgKeys.putIfAbsent(m.id, () => GlobalKey());
+                      return _SizeReporter(
+                        onHeight: (h) => _itemHeights[m.id] = h,
+                        child: Align(
+                          alignment: isMe ? Alignment.centerRight : Alignment.centerLeft,
+                          child: ConstrainedBox(
+                            key: key,
+                            constraints: const BoxConstraints(maxWidth: 480),
+                            child: GestureDetector(
+                              behavior: HitTestBehavior.opaque,
+                              onLongPressStart: (_) => HapticFeedback.mediumImpact(),
+                              onLongPress: () => _openMessageMenu(m),
+                              child: bubble,
+                            ),
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+                ),
+              ),
+
+              // Reply-bar (мераем реальную высоту)
+              if (_replyTarget != null)
+                _SizeReporter(
+                  onHeight: (h) => _replyBarHeight = h, // измерение
+                  child: _ReplyBar(
+                    author: _replyTarget!.actorDisplayName ?? _replyTarget!.actorId ?? 'Сообщение',
+                    snippet: _replyTarget!.isFile
+                        ? p.basename(_replyTarget!.filePath ?? '')
+                        : (_replyTarget!.message ?? ''),
+                    isFile: _replyTarget!.isFile,
+                    onTap: () {
+                      final id = _replyTarget!.id;
+                      _scrollToMessageEnsureLoaded(id);
+                    },
+                    onClose: () => setState(() => _replyTarget = null),
+                  ),
+                ),
+
+              // Баннер записи (тоже меряем)
+              if (_isRecording)
+                _SizeReporter(
+                  onHeight: (h) => _recordBarHeight = h, // измерение
+                  child: _RecordingBanner(
+                    level: _recAmp,
+                    error: _recordError,
+                    onCancel: _cancelRecord,
+                    onStopAndSend: _toggleRecord,
+                  ),
+                ),
+
+              // Блок ввода (как и было, только явно оставляем измерение)
+              SafeArea(
+                child: _SizeReporter(
+                  onHeight: (h) => _inputBarHeight = h, // измерение
+                  child: Row(
+                    children: [
+                      IconButton(
+                        icon: const Icon(Icons.add),
+                        onPressed: _openAttachSheet,
+                      ),
+                      Expanded(
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(vertical: 8),
+                          child: TextField(
+                            controller: _input,
+                            focusNode: _inputFocus,
+                            decoration: const InputDecoration(
+                              hintText: 'Сообщение...',
+                              border: OutlineInputBorder(),
+                              isDense: true,
+                              contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                            ),
+                            onSubmitted: (_) => _sendText(),
+                          ),
+                        ),
+                      ),
+                      IconButton(
+                        icon: const Icon(Icons.send),
+                        onPressed: _sendText,
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+
+            ],
+          ),
+          // FAB "вниз" с корректной геометрией
+          Positioned(
+            right: 16,
+            bottom: 16.0 + MediaQuery.of(context).padding.bottom
+                    + _replyBarHeight + _recordBarHeight + _inputBarHeight, // NEW
+            child: AnimatedScale(
+              duration: const Duration(milliseconds: 150),
+              scale: _showDownBtn ? 1 : 0.0,
+              child: FloatingActionButton(
+                heroTag: 'toBottom',
+                mini: true,
+                elevation: 3,
+                onPressed: _scrollToBottom,
+                child: const Icon(Icons.arrow_downward),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// -------------------- Small UI helpers --------------------
+
+class _RecordingBanner extends StatelessWidget {
+  const _RecordingBanner({
+    required this.level,
+    required this.onCancel,
+    required this.onStopAndSend,
+    this.error,
+  });
+
+  final double level;
+  final VoidCallback onCancel;
+  final VoidCallback onStopAndSend;
+  final String? error;
+
+  @override
+  Widget build(BuildContext context) {
+    final bg = Colors.red.withOpacity(0.08);
+    final subtle = Theme.of(context).textTheme.bodyMedium;
+
+    return Container(
+      color: bg,
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      child: SafeArea(
+        top: false,
+        bottom: false,
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            final tight = constraints.maxWidth < 380;
+            return Wrap(
+              crossAxisAlignment: WrapCrossAlignment.center,
+              spacing: 10,
+              runSpacing: 6,
+              children: [
+                const Icon(Icons.mic, color: Colors.red),
+                ConstrainedBox(
+                  constraints: BoxConstraints(maxWidth: tight ? constraints.maxWidth * 0.35 : constraints.maxWidth * 0.45),
+                  child: Text(
+                    error == null ? 'Идёт запись…' : error!,
+                    style: subtle?.copyWith(color: error == null ? null : Colors.red),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+                _RecordingEq(level: level),
+                TextButton(onPressed: onCancel, child: const Text('Отменить')),
+                FilledButton.icon(
+                  onPressed: onStopAndSend,
+                  icon: const Icon(Icons.stop),
+                  label: Text(tight ? 'Стоп' : 'Стоп и отправить'),
+                ),
+              ],
+            );
+          },
+        ),
+      ),
+    );
+  }
+}
+
+class _ReplyMini extends StatelessWidget {
+  const _ReplyMini({
+    required this.author,
+    required this.snippet,
+    required this.isFile,
+    required this.onTap,
+  });
+
+  final String author;
+  final String snippet;
+  final bool isFile;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final color = Theme.of(context).colorScheme.primary;
+    final textStyle = Theme.of(context).textTheme.bodySmall!;
+    return InkWell(
+      onTap: onTap,
+      child: Container(
+        margin: const EdgeInsets.only(bottom: 8),
+        padding: const EdgeInsets.fromLTRB(10, 8, 10, 8),
+        decoration: BoxDecoration(
+          color: Theme.of(context).colorScheme.surfaceVariant.withOpacity(0.55),
+          borderRadius: BorderRadius.circular(8),
+          border: Border(left: BorderSide(color: color, width: 3)),
+        ),
+        child: Row(
+          children: [
+            Icon(isFile ? Icons.attach_file : Icons.reply, size: 16, color: color),
+            const SizedBox(width: 8),
+            Expanded(
+              child: RichText(
+                text: TextSpan(
+                  style: textStyle,
+                  children: [
+                    TextSpan(text: author, style: textStyle.copyWith(fontWeight: FontWeight.w600, color: color)),
+                    const TextSpan(text: '  '),
+                    TextSpan(text: snippet, style: textStyle),
+                  ],
+                ),
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _ReplyBar extends StatelessWidget {
+  const _ReplyBar({
+    required this.author,
+    required this.snippet,
+    required this.isFile,
+    required this.onTap,
+    required this.onClose,
+  });
+
+  final String author;
+  final String snippet;
+  final bool isFile;
+  final VoidCallback onTap;
+  final VoidCallback onClose;
+
+  @override
+  Widget build(BuildContext context) {
+    final color = Theme.of(context).colorScheme.primary;
+    return Container(
+      decoration: BoxDecoration(
+        color: Theme.of(context).colorScheme.surface.withOpacity(0.7),
+        border: Border(left: BorderSide(color: color, width: 4)),
+      ),
+      padding: const EdgeInsets.fromLTRB(10, 8, 4, 8),
+      child: Row(
+        children: [
+          Icon(isFile ? Icons.attach_file : Icons.reply, size: 18, color: color),
+          const SizedBox(width: 8),
+          Expanded(
+            child: InkWell(
+              onTap: onTap,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(author,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(color: color, fontWeight: FontWeight.w600)),
+                  const SizedBox(height: 2),
+                  Text(
+                    snippet,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
+                ],
+              ),
+            ),
+          ),
+          IconButton(icon: const Icon(Icons.close), onPressed: onClose)
+        ],
+      ),
+    );
+  }
+}
+
+class _RecordingEq extends StatelessWidget {
+  const _RecordingEq({required this.level});
+  final double level;
+
+  @override
+  Widget build(BuildContext context) {
+    final bars = <double>[0.9, 0.7, 1.0, 0.7, 0.9].map((w) {
+      final h = (6 + 22 * (level * w)).clamp(6, 28).toDouble();
+      return h;
+    }).toList();
+
+    return SizedBox(
+      height: 28,
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          for (final h in bars)
+            AnimatedContainer(
+              duration: const Duration(milliseconds: 100),
+              curve: Curves.easeOut,
+              margin: const EdgeInsets.symmetric(horizontal: 2),
+              width: 4,
+              height: h,
+              decoration: BoxDecoration(
+                color: Colors.red,
+                borderRadius: BorderRadius.circular(2),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class _SizeReporter extends StatefulWidget {
+  const _SizeReporter({required this.child, required this.onHeight});
+  final Widget child;
+  final void Function(double height) onHeight;
+
+  @override
+  State<_SizeReporter> createState() => _SizeReporterState();
+}
+
+class _SizeReporterState extends State<_SizeReporter> {
+  final _key = GlobalKey();
+
+  @override
+  Widget build(BuildContext context) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final ctx = _key.currentContext;
+      if (ctx != null) {
+        final size = (ctx.findRenderObject() as RenderBox?)?.size;
+        if (size != null) widget.onHeight(size.height);
+      }
+    });
+    return Container(key: _key, child: widget.child);
+  }
+}
+
+class _MediaCache {
+  // In-memory быстрый кеш
+  static final _map = <String, Uint8List>{};
+  static Uint8List? get(String k) => _map[k];
+  static void set(String k, Uint8List v) {
+    _map[k] = v;
+  }
+}
+
+// -------------------- File bubbles & media --------------------
+
+class FileBubble extends StatefulWidget {
+  const FileBubble({
+    super.key,
+    required this.api,
+    required this.filePath,
+    required this.mimeType,
+    this.onOpenImage,
+  });
+
+  final NextcloudTalkApi api;
+  final String filePath;
+  final String mimeType;
+  final VoidCallback? onOpenImage;
+
+  @override
+  State<FileBubble> createState() => _FileBubbleState();
+}
+
+class _FileBubbleState extends State<FileBubble> {
+  Uint8List? _imageBytes;
+  bool _loading = false;
+  String? _error;
+  late final String _webdavUrl;
+  late final Map<String, String> _headers;
+
+  @override
+  void initState() {
+    super.initState();
+    _webdavUrl = widget.api.webdavFileUrl(widget.filePath);
+    _headers = widget.api.authHeaders;
+    if (widget.mimeType.startsWith('image/')) {
+      _loadImage();
+    }
+  }
+
+  Future<void> _loadImage() async {
+    if (!mounted) return;
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    try {
+      // 1) RAM
+      final cached = _MediaCache.get(_webdavUrl);
+      if (cached != null) {
+        if (!mounted) return;
+        setState(() => _imageBytes = cached);
+      } else {
+        // 2) Disk
+        final disk = await ImageDiskCache.get(_webdavUrl);
+        if (disk != null) {
+          _MediaCache.set(_webdavUrl, disk);
+          if (!mounted) return;
+          setState(() => _imageBytes = disk);
+        } else {
+          // 3) Network
+          final r = await http.get(Uri.parse(_webdavUrl), headers: _headers);
+          if (!mounted) return;
+          if (r.statusCode == 200) {
+            _MediaCache.set(_webdavUrl, r.bodyBytes);
+            await ImageDiskCache.put(_webdavUrl, r.bodyBytes);
+            setState(() => _imageBytes = r.bodyBytes);
+          } else {
+            setState(() => _error = 'HTTP ${r.statusCode}');
+          }
+        }
+      }
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _error = e.toString());
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  void _openVideo() {
+    Navigator.of(context).push(MaterialPageRoute(
+      builder: (_) => VideoPlayerScreen(url: _webdavUrl, headers: _headers, title: p.basename(widget.filePath)),
+    ));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final isImg = widget.mimeType.startsWith('image/');
+    final isAudio = widget.mimeType.startsWith('audio/');
+    final isVideo = widget.mimeType.startsWith('video/');
+
+    if (isImg) {
+      if (_loading) return const SizedBox(height: 200, child: Center(child: CircularProgressIndicator()));
+      if (_error != null) return Text('Ошибка превью: $_error');
+      if (_imageBytes == null) return const Text('Нет превью');
+      return GestureDetector(
+        onTap: widget.onOpenImage ?? () {},
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(12),
+          child: Image.memory(_imageBytes!, fit: BoxFit.cover),
+        ),
+      );
+    }
+
+    if (isAudio) {
+      return AudioVoiceBubble(url: _webdavUrl, headers: _headers);
+    }
+
+    if (isVideo) {
+      return VideoInlinePreview(
+        url: _webdavUrl,
+        headers: _headers,
+        onOpenFull: _openVideo,
+      );
+    }
+
+    final name = p.basename(widget.filePath);
+    return ListTile(
+      leading: const Icon(Icons.insert_drive_file_outlined),
+      title: Text(name),
+      subtitle: Text(widget.mimeType),
+      trailing: IconButton(
+        icon: const Icon(Icons.open_in_new),
+        onPressed: () async {
+          final uri = widget.api.basicAuthInUrl(_webdavUrl);
+          final ok = await launchUrl(Uri.parse(uri), mode: LaunchMode.externalApplication);
+          if (!ok && mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Не удалось открыть файл')));
+          }
+        },
+      ),
+    );
+  }
+}
+
+// -------------------- Audio bubble --------------------
+
+class AudioVoiceBubble extends StatefulWidget {
+  const AudioVoiceBubble({super.key, required this.url, required this.headers});
+  final String url;
+  final Map<String, String> headers;
+
+  @override
+  State<AudioVoiceBubble> createState() => _AudioVoiceBubbleState();
+}
+
+class _AudioVoiceBubbleState extends State<AudioVoiceBubble> {
+  late final AudioPlayer _player;
+  StreamSubscription<Duration>? _posSub;
+  StreamSubscription<PlayerState>? _stateSub;
+
+  Duration _pos = Duration.zero;
+  Duration _dur = Duration.zero;
+  bool _ready = false;
+
+  late final List<double> _wave;
+
+  @override
+  void initState() {
+    super.initState();
+    _player = AudioPlayer();
+    PlaybackHub.registerAudio(_player);
+    _init();
+    _posSub = _player.positionStream.listen((d) {
+      if (!mounted) return;
+      setState(() => _pos = d);
+    });
+    _stateSub = _player.playerStateStream.listen((_) {
+      if (!mounted) return;
+      setState(() {});
+    });
+
+    _wave = _makeWave(widget.url);
+  }
+
+  @override
+  void dispose() {
+    PlaybackHub.unregisterAudio(_player);
+    _posSub?.cancel();
+    _stateSub?.cancel();
+    _player.dispose();
+    super.dispose();
+  }
+
+  List<double> _makeWave(String seed) {
+    final n = 64;
+    final out = List<double>.filled(n, 0.0);
+    int s = seed.hashCode ^ 0x9e3779b9;
+    double rnd() {
+      s ^= (s << 13);
+      s ^= (s >> 17);
+      s ^= (s << 5);
+      return ((s & 0x7fffffff) / 0x7fffffff);
+    }
+
+    for (int i = 0; i < n; i++) {
+      final f1 = rnd();
+      final f2 = rnd();
+      final f3 = rnd();
+      double v = 0.55 * f1 + 0.3 * f2 + 0.15 * f3;
+      v += 0.12 * MathUtils.sin(i * 0.6) + 0.08 * MathUtils.sin(i * 0.18 + 1.7);
+      out[i] = v;
+    }
+    for (int k = 0; k < 2; k++) {
+      for (int i = 1; i < n - 1; i++) {
+        out[i] = (out[i - 1] + out[i] * 2 + out[i + 1]) / 4.0;
+      }
+    }
+    double minV = out.reduce((a, b) => a < b ? a : b);
+    double maxV = out.reduce((a, b) => a > b ? a : b);
+    final range = (maxV - minV).abs() < 1e-6 ? 1.0 : (maxV - minV);
+    return out
+        .map((v) => ((v - minV) / range))
+        .map((v) => (0.15 + 0.85 * v).clamp(0.15, 1.0).toDouble())
+        .toList();
+  }
+
+  Future<void> _init() async {
+    try {
+      await _player.setUrl(widget.url, headers: widget.headers);
+      if (!mounted) return;
+      setState(() {
+        _ready = true;
+        _dur = _player.duration ?? Duration.zero;
+      });
+    } catch (_) {}
+  }
+
+  void _toggle() async {
+    if (!_ready) return;
+    if (_player.playing) {
+      await _player.pause();
+    } else {
+      await _player.play();
+    }
+    if (!mounted) return;
+    setState(() {});
+  }
+
+  void _seekTo(double frac) {
+    if (_dur.inMilliseconds == 0) return;
+    final ms = (frac * _dur.inMilliseconds).clamp(0, _dur.inMilliseconds).toInt();
+    _player.seek(Duration(milliseconds: ms));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final playing = _player.playing;
+    final frac = _dur.inMilliseconds == 0 ? 0.0 : _pos.inMilliseconds / _dur.inMilliseconds;
+
+    return Container(
+      padding: const EdgeInsets.all(8),
+      decoration: BoxDecoration(
+        color: Theme.of(context).colorScheme.surface.withOpacity(0.5),
+        borderRadius: BorderRadius.circular(14),
+      ),
+      child: Row(
+        children: [
+          InkWell(
+            onTap: _ready ? _toggle : null,
+            customBorder: const CircleBorder(),
+            child: Container(
+              width: 44,
+              height: 44,
+              decoration: BoxDecoration(
+                color: Theme.of(context).colorScheme.primary,
+                shape: BoxShape.circle,
+              ),
+              child: Icon(
+                playing ? Icons.pause : Icons.play_arrow,
+                color: Colors.white,
+              ),
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTapDown: (d) {
+                final box = d.localPosition.dx;
+                final width = context.size?.width ?? 1;
+                _seekTo(((box / width).clamp(0.0, 1.0)).toDouble());
+              },
+              child: CustomPaint(
+                painter: _WavePainter(_wave, progress: frac, color: Theme.of(context).colorScheme.primary),
+                size: const Size(double.infinity, 36),
+              ),
+            ),
+          ),
+          const SizedBox(width: 10),
+          Text(
+            _format(_pos),
+            style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                  fontFeatures: [const ui.FontFeature.tabularFigures()],
+                ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  String _format(Duration d) {
+    final m = d.inMinutes.remainder(60).toString().padLeft(2, '0');
+    final s = d.inSeconds.remainder(60).toString().padLeft(2, '0');
+    final h = d.inHours;
+    return h > 0 ? '$h:$m:$s' : '$m:$s';
+  }
+}
+
+class _WavePainter extends CustomPainter {
+  _WavePainter(this.values, {required this.progress, required this.color});
+  final List<double> values;
+  final double progress;
+  final Color color;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paintBg = Paint()
+      ..color = Colors.grey.withOpacity(0.35)
+      ..style = PaintingStyle.fill;
+    final paintFg = Paint()
+      ..color = color
+      ..style = PaintingStyle.fill;
+
+    final n = values.length;
+    final barWidth = size.width / (n * 1.6);
+    final gap = barWidth * 0.6;
+    final baseline = size.height / 2;
+
+    double x = 0;
+    for (int i = 0; i < n; i++) {
+      final h = values[i] * (size.height / 2);
+      final rect = Rect.fromLTWH(x, baseline - h, barWidth, h * 2);
+      canvas.drawRRect(RRect.fromRectAndRadius(rect, const Radius.circular(2)), paintBg);
+
+      final filledTo = progress * size.width;
+      if (x < filledTo) {
+        final fillWidth = (filledTo - x).clamp(0, barWidth).toDouble();
+        if (fillWidth > 0) {
+          final r2 = Rect.fromLTWH(x, baseline - h, fillWidth, h * 2);
+          canvas.drawRRect(RRect.fromRectAndRadius(r2, const Radius.circular(2)), paintFg);
+        }
+      }
+
+      x += barWidth + gap;
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _WavePainter oldDelegate) =>
+      oldDelegate.values != values || oldDelegate.progress != progress || oldDelegate.color != color;
+}
+
+// -------------------- Video thumbnail --------------------
+
+class VideoInlinePreview extends StatefulWidget {
+  const VideoInlinePreview({super.key, required this.url, required this.headers, required this.onOpenFull});
+  final String url;
+  final Map<String, String> headers;
+  final VoidCallback onOpenFull;
+
+  @override
+  State<VideoInlinePreview> createState() => _VideoInlinePreviewState();
+}
+
+class _VideoInlinePreviewState extends State<VideoInlinePreview> {
+  VideoPlayerController? _ctrl;
+  bool _ready = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _ctrl = VideoPlayerController.networkUrl(Uri.parse(widget.url), httpHeaders: widget.headers)
+      ..initialize().then((_) {
+        if (!mounted) return;
+        setState(() => _ready = true);
+      });
+    _ctrl?.setVolume(0);
+    _ctrl?.pause();
+    if (_ctrl != null) PlaybackHub.registerVideo(_ctrl!);
+  }
+
+  @override
+  void dispose() {
+    if (_ctrl != null) PlaybackHub.unregisterVideo(_ctrl!);
+    _ctrl?.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final ctrl = _ctrl;
+    final double safeAR = ((ctrl?.value.aspectRatio ?? (16 / 9)).clamp(0.5, 3.0)).toDouble();
+
+    return GestureDetector(
+      onTap: widget.onOpenFull,
+      child: AspectRatio(
+        aspectRatio: safeAR,
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            if (_ready && ctrl != null)
+              VideoPlayer(ctrl)
+            else
+              Container(color: Colors.black12),
+            const Align(
+              alignment: Alignment.center,
+              child: Icon(Icons.play_circle, size: 48, color: Colors.white70),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// -------------------- Image viewer (с догрузкой ранних фото) --------------------
+
+typedef LoadMoreBefore = Future<int> Function();
+
+class ImageViewerPage extends StatefulWidget {
+  const ImageViewerPage({
+    super.key,
+    required this.api,
+    required this.roomToken,
+    required this.items,
+    required this.startIndex,
+    required this.headers,
+    required this.myReactions,
+    required this.onReactionChanged,
+    this.loadMoreBefore,
+  });
+
+  final NextcloudTalkApi api;
+  final String roomToken;
+  final List<_ImageItem> items;
+  final int startIndex;
+  final Map<String, String> headers;
+
+  final Map<int, String> myReactions;
+  final void Function(int messageId, String? emojiOrNull) onReactionChanged;
+
+  final LoadMoreBefore? loadMoreBefore;
+
+  @override
+  State<ImageViewerPage> createState() => _ImageViewerPageState();
+}
+
+class _ImageViewerPageState extends State<ImageViewerPage> with SingleTickerProviderStateMixin {
+  late final PageController _pageCtrl;
+  late int _index;
+
+  final Map<String, Uint8List?> _bytes = {};
+
+  final TransformationController _tc = TransformationController();
+  bool _pagerLocked = false;
+
+  late final AnimationController _dismissCtrl;
+  double _dragOffsetX = 0.0;
+  double _viewportWidth = 1.0;
+
+  bool _uiVisible = true;
+  bool _isPinching = false;
+
+  // NEW: реактивный индекс для счётчика
+  late final ValueNotifier<int> _pageIndexVN = ValueNotifier<int>(0);
+
+  static const _emojiChoices = [
+    '👍','❤️','😂','😮','😢','🔥','👏','😍','😡','🎉','🤔','🤯','🙏','👌','😎','💯'
+  ];
+
+  @override
+  void initState() {
+    super.initState();
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    _index = widget.startIndex.clamp(0, widget.items.length - 1).toInt();
+    _pageCtrl = PageController(initialPage: _index);
+    _pageIndexVN.value = _index; // инициализация
+    _preload(_index);
+    _dismissCtrl = AnimationController(vsync: this, duration: const Duration(milliseconds: 220))
+      ..addListener(() {
+        setState(() {
+          _dragOffsetX = _viewportWidth * _dismissCtrl.value;
+        });
+      });
+  }
+
+  @override
+  void dispose() {
+    _pageIndexVN.dispose();
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    _dismissCtrl.dispose();
+    super.dispose();
+  }
+
+  Future<void> _preload(int i) async {
+    if (i < 0 || i >= widget.items.length) return;
+    final url = widget.items[i].url;
+    if (_bytes.containsKey(url)) return;
+
+    // 1) RAM
+    final cached = _MediaCache.get(url);
+    if (cached != null) {
+      setState(() => _bytes[url] = cached);
+      return;
+    }
+
+    // 2) Disk
+    final disk = await ImageDiskCache.get(url);
+    if (disk != null) {
+      _MediaCache.set(url, disk);
+      setState(() => _bytes[url] = disk);
+      return;
+    }
+
+    // 3) Network
+    try {
+      final r = await http.get(Uri.parse(url), headers: widget.headers);
+      if (!mounted) return;
+      if (r.statusCode == 200) {
+        _MediaCache.set(url, r.bodyBytes);
+        await ImageDiskCache.put(url, r.bodyBytes);
+        setState(() => _bytes[url] = r.bodyBytes);
+      } else {
+        setState(() => _bytes[url] = null);
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('HTTP ${r.statusCode}')));
+      }
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _bytes[url] = null);
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Ошибка: $e')));
+    }
+  }
+
+  void _onPageChanged(int i) async {
+    setState(() => _index = i);
+    _pageIndexVN.value = i; // NEW: обновляем счётчик
+    _tc.value = Matrix4.identity();
+    _preload(i - 1);
+    _preload(i + 1);
+
+    if (i == 0 && widget.loadMoreBefore != null) {
+      final before = widget.items.length;
+      final added = await widget.loadMoreBefore!.call();
+      if (!mounted) return;
+      if (added > 0) {
+        final now = widget.items.length;
+        final delta = now - before;
+        final newIndex = i + delta;
+        _pageCtrl.jumpToPage(newIndex);
+        _index = newIndex;
+        _pageIndexVN.value = newIndex; // NEW
+        setState(() {});
+        _preload(newIndex - 1);
+      }
+    }
+  }
+
+  double _currentScale() => _tc.value.storage[0];
+
+  void _onInteractionUpdate(ScaleUpdateDetails _) {
+    final locked = _currentScale() > 1.01;
+    if (locked != _pagerLocked) setState(() => _pagerLocked = locked);
+  }
+
+  void _onInteractionEnd(ScaleEndDetails _) {
+    final locked = _currentScale() > 1.01;
+    if (locked != _pagerLocked) setState(() => _pagerLocked = locked);
+  }
+
+  Future<void> _toggleReaction(String emoji) async {
+    final msgId = widget.items[_index].messageId;
+    final current = widget.myReactions[msgId];
+
+    try {
+      if (current == emoji) {
+        await widget.api.deleteReaction(widget.roomToken, msgId, emoji);
+        widget.myReactions.remove(msgId);
+        widget.onReactionChanged(msgId, null);
+      } else {
+        if (current != null) {
+          await widget.api.deleteReaction(widget.roomToken, msgId, current);
+        }
+        await widget.api.addReaction(widget.roomToken, msgId, emoji);
+        widget.myReactions[msgId] = emoji;
+        widget.onReactionChanged(msgId, emoji);
+      }
+      if (mounted) setState(() {});
+       Future.delayed(const Duration(seconds: 2), () {
+      if (mounted) {
+        final chatState = context.findAncestorStateOfType<_ChatScreenState>();
+        chatState?._load();
+      }
+       });
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Не удалось изменить реакцию: $e')));
+    }
+  }
+
+  void _openEmojiPicker() async {
+    final selected = await showModalBottomSheet<String>(
+      context: context,
+      showDragHandle: true,
+      builder: (ctx) {
+        return SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.all(12),
+            child: Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                for (final e in _emojiChoices)
+                  ElevatedButton(
+                    onPressed: () => Navigator.pop(ctx, e),
+                    child: Text(e, style: const TextStyle(fontSize: 24)),
+                  ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+    if (selected != null) _toggleReaction(selected);
+  }
+
+  void _onHDragUpdate(DragUpdateDetails d) {
+    if (_pagerLocked || _isPinching || _currentScale() > 1.01) return;
+    setState(() => _dragOffsetX = (_dragOffsetX + d.delta.dx).clamp(0.0, double.infinity));
+  }
+
+  void _onHDragEnd(DragEndDetails d) {
+    if (_pagerLocked || _isPinching || _currentScale() > 1.01) {
+      _dismissCtrl.value = _dragOffsetX / _viewportWidth;
+      _dismissCtrl.animateBack(0.0, curve: Curves.easeOutCubic);
+      return;
+    }
+    final v = d.primaryVelocity ?? 0.0;
+    final shouldClose = _dragOffsetX > _viewportWidth * 0.25 || v > 600;
+    _dismissCtrl.value = _dragOffsetX / _viewportWidth;
+    if (shouldClose) {
+      _dismissCtrl.animateTo(1.0, curve: Curves.easeOutCubic).whenComplete(() {
+        if (mounted) Navigator.of(context).maybePop();
+      });
+    } else {
+      _dismissCtrl.animateBack(0.0, curve: Curves.easeOutCubic);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final w = MediaQuery.of(context).size.width;
+    _viewportWidth = w;
+    final bgAlpha = (1.0 - (_dragOffsetX / _viewportWidth).clamp(0.0, 1.0)) * 0.6;
+    final myEmoji = widget.myReactions[widget.items[_index].messageId];
+
+    return Scaffold(
+      backgroundColor: Colors.transparent,
+      body: SafeArea(
+        top: false,
+        bottom: false,
+        child: GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onScaleStart: (_) => setState(() => _isPinching = true),
+          onScaleEnd:   (_) => setState(() => _isPinching = false),
+          onHorizontalDragUpdate: _onHDragUpdate,
+          onHorizontalDragEnd: _onHDragEnd,
+          child: Stack(
+            children: [
+              Positioned.fill(child: Container(color: Colors.black.withOpacity(bgAlpha))),
+              Transform.translate(
+                offset: Offset(_dragOffsetX, 0),
+                child: PageView.builder(
+                  scrollDirection: Axis.vertical,
+                  controller: _pageCtrl,
+                  physics: _pagerLocked ? const NeverScrollableScrollPhysics() : const PageScrollPhysics(),
+                  onPageChanged: _onPageChanged,
+                  itemCount: widget.items.length,
+                  itemBuilder: (context, i) {
+                    final it = widget.items[i];
+                    _preload(i);
+                    final data = _bytes[it.url];
+
+                    return Center(
+                      child: data == null
+                          ? const CircularProgressIndicator(color: Colors.white70)
+                          : GestureDetector(
+                              onTap: () => setState(() => _uiVisible = !_uiVisible),
+                              child: InteractiveViewer(
+                                transformationController: _tc,
+                                clipBehavior: Clip.none,
+                                minScale: 1.0,
+                                maxScale: 5.0,
+                                panEnabled: true,
+                                scaleEnabled: true,
+                                onInteractionUpdate: _onInteractionUpdate,
+                                onInteractionEnd: _onInteractionEnd,
+                                child: Image.memory(data, fit: BoxFit.contain),
+                              ),
+                            ),
+                    );
+                  },
+                ),
+              ),
+
+              // TOP UI
+              IgnorePointer(
+                ignoring: !_uiVisible,
+                child: AnimatedOpacity(
+                  opacity: _uiVisible ? 1 : 0,
+                  duration: const Duration(milliseconds: 150),
+                  child: SafeArea(
+                    child: Container(
+                      height: 56,
+                      decoration: BoxDecoration(
+                        gradient: LinearGradient(
+                          colors: [Colors.black.withOpacity(0.20), Colors.transparent],
+                          begin: Alignment.topCenter,
+                          end: Alignment.bottomCenter,
+                        ),
+                      ),
+                      child: Stack(
+                        children: [
+                          Align(
+                            alignment: Alignment.centerLeft,
+                            child: TextButton.icon(
+                              style: TextButton.styleFrom(
+                                foregroundColor: Colors.white,
+                                padding: const EdgeInsets.symmetric(horizontal: 8),
+                              ),
+                              onPressed: () => Navigator.of(context).pop(),
+                              icon: const Icon(Icons.arrow_back),
+                              label: const Text('Назад'),
+                            ),
+                          ),
+                          // NEW: реактивный счётчик
+                          Align(
+                            alignment: Alignment.center,
+                            child: ValueListenableBuilder<int>(
+                              valueListenable: _pageIndexVN,
+                              builder: (_, idx, __) {
+                                final total = widget.items.length;
+                                return Text(
+                                  '${idx + 1} / $total',
+                                  style: const TextStyle(
+                                    color: Colors.white,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                );
+                              },
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+
+              // BOTTOM UI + реакция
+              IgnorePointer(
+                ignoring: !_uiVisible,
+                child: AnimatedOpacity(
+                  opacity: _uiVisible ? 1 : 0,
+                  duration: const Duration(milliseconds: 150),
+                  child: SafeArea(
+                    child: Align(
+                      alignment: Alignment.bottomCenter,
+                      child: Container(
+                        padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+                        decoration: BoxDecoration(
+                          gradient: LinearGradient(
+                            colors: [Colors.transparent, Colors.black.withOpacity(0.24)],
+                            begin: Alignment.topCenter,
+                            end: Alignment.bottomCenter,
+                          ),
+                        ),
+                        child: Row(
+                          crossAxisAlignment: CrossAxisAlignment.end,
+                          children: [
+                            FilledButton.icon(
+                              onPressed: () {
+                                final msgId = widget.items[_index].messageId;
+                                Navigator.of(context).pop(msgId);
+                              },
+                              icon: const Icon(Icons.textsms_outlined),
+                              label: const Text('Показать в чате'),
+                            ),
+                            const Spacer(),
+                            Column(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                if (myEmoji != null)
+                                  Container(
+                                    margin: const EdgeInsets.only(bottom: 6),
+                                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                                    decoration: BoxDecoration(
+                                      color: Colors.black54,
+                                      borderRadius: BorderRadius.circular(18),
+                                    ),
+                                    child: Text(myEmoji, style: const TextStyle(fontSize: 18)),
+                                  ),
+                                FilledButton.icon(
+                                  onPressed: _openEmojiPicker,
+                                  icon: const Icon(Icons.emoji_emotions_outlined),
+                                  label: const Text('Реакция'),
+                                ),
+                              ],
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+
+class _ViewerCounter extends StatelessWidget {
+  const _ViewerCounter();
+
+  @override
+  Widget build(BuildContext context) {
+    final state = context.findAncestorStateOfType<_ImageViewerPageState>();
+    final idx = (state?._index ?? 0) + 1;
+    final total = state?.widget.items.length ?? 0;
+    return Text(
+      '$idx / $total',
+      style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600),
+      textAlign: TextAlign.center,
+    );
+  }
+}
+
+class _ImageItem {
+  _ImageItem({required this.url, required this.name, required this.messageId});
+  final String url;
+  final String name;
+  final int messageId;
+}
+
+// -------------------- Fullscreen video --------------------
+
+class VideoPlayerScreen extends StatefulWidget {
+  const VideoPlayerScreen({super.key, required this.url, required this.headers, required this.title});
+  final String url;
+  final Map<String, String> headers;
+  final String title;
+
+  @override
+  State<VideoPlayerScreen> createState() => _VideoPlayerScreenState();
+}
+
+class _VideoPlayerScreenState extends State<VideoPlayerScreen> with SingleTickerProviderStateMixin {
+  VideoPlayerController? _ctrl;
+  bool _ready = false;
+
+  bool _uiVisible = true;
+  Timer? _hideTimer;
+
+  Duration _pos = Duration.zero;
+  Duration _dur = Duration.zero;
+
+  // анимация закрытия как у фото
+  late final AnimationController _dismissCtrl;
+  double _dragOffsetX = 0.0;
+  double _viewportWidth = 1.0;
+
+  // зум
+  final TransformationController _tc = TransformationController();
+  bool _isPinching = false;
+
+  void _restartHideTimer() {
+    _hideTimer?.cancel();
+    _hideTimer = Timer(const Duration(seconds: 3), () {
+      if (!mounted) return;
+      setState(() => _uiVisible = false);
+    });
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+
+    _dismissCtrl = AnimationController(vsync: this, duration: const Duration(milliseconds: 220))
+      ..addListener(() {
+        setState(() {
+          _dragOffsetX = _viewportWidth * _dismissCtrl.value;
+        });
+      });
+
+    _ctrl = VideoPlayerController.networkUrl(Uri.parse(widget.url), httpHeaders: widget.headers)
+      ..initialize().then((_) {
+        if (!mounted) return;
+        _dur = _ctrl!.value.duration;
+        setState(() => _ready = true);
+        _ctrl!.play();
+        _restartHideTimer();
+      });
+    _ctrl?.addListener(() {
+      if (!mounted || _ctrl == null) return;
+      final v = _ctrl!.value;
+      if (_dur != v.duration || _pos != v.position) {
+        setState(() {
+          _dur = v.duration;
+          _pos = v.position;
+        });
+      }
+    });
+    if (_ctrl != null) PlaybackHub.registerVideo(_ctrl!);
+  }
+
+  @override
+  void dispose() {
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    _hideTimer?.cancel();
+    if (_ctrl != null) PlaybackHub.unregisterVideo(_ctrl!);
+    _ctrl?.dispose();
+    _dismissCtrl.dispose();
+    super.dispose();
+  }
+
+  String _fmt(Duration d) {
+    final h = d.inHours;
+    final m = d.inMinutes.remainder(60).toString().padLeft(2, '0');
+    final s = d.inSeconds.remainder(60).toString().padLeft(2, '0');
+    return h > 0 ? '$h:$m:$s' : '${d.inMinutes.remainder(60)}:$s';
+  }
+
+  void _seekRelative(int seconds) {
+    if (_ctrl == null) return;
+    final target = _pos + Duration(seconds: seconds);
+    Duration clamped;
+    if (target < Duration.zero) {
+      clamped = Duration.zero;
+    } else if (_dur != Duration.zero && target > _dur) {
+      clamped = _dur;
+    } else {
+      clamped = target;
+    }
+    _ctrl!.seekTo(clamped);
+  }
+
+  double _currentScale() => _tc.value.storage[0];
+
+  void _onInteractionUpdate(ScaleUpdateDetails _) {
+    setState(() {});
+  }
+
+  void _onHorizontalDragUpdate(DragUpdateDetails d) {
+    if (_isPinching || _currentScale() > 1.01) return;
+    setState(() => _dragOffsetX = (_dragOffsetX + d.delta.dx).clamp(0.0, double.infinity));
+  }
+
+  void _onHorizontalDragEnd(DragEndDetails d) {
+    if (_isPinching || _currentScale() > 1.01) {
+      _dismissCtrl.value = _dragOffsetX / _viewportWidth;
+      _dismissCtrl.animateBack(0.0, curve: Curves.easeOutCubic);
+      return;
+    }
+    final v = d.primaryVelocity ?? 0.0;
+    final shouldClose = _dragOffsetX > _viewportWidth * 0.25 || v > 600;
+    _dismissCtrl.value = _dragOffsetX / _viewportWidth;
+    if (shouldClose) {
+      _dismissCtrl.animateTo(1.0, curve: Curves.easeOutCubic).whenComplete(() {
+        if (mounted) Navigator.of(context).maybePop();
+      });
+    } else {
+      _dismissCtrl.animateBack(0.0, curve: Curves.easeOutCubic);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final ctrl = _ctrl;
+    final progress = _dur.inMilliseconds == 0 ? 0.0 : _pos.inMilliseconds / _dur.inMilliseconds;
+    _viewportWidth = MediaQuery.of(context).size.width;
+    final bgAlpha = (1.0 - (_dragOffsetX / _viewportWidth).clamp(0.0, 1.0)) * 0.6;
+
+    return Scaffold(
+      backgroundColor: Colors.transparent,
+      body: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: () {
+          setState(() => _uiVisible = !_uiVisible);
+          if (_uiVisible) _restartHideTimer();
+        },
+        onDoubleTapDown: (details) {
+          final w = MediaQuery.of(context).size.width;
+          if (details.localPosition.dx < w / 2) {
+            _seekRelative(-10);
+          } else {
+            _seekRelative(10);
+          }
+          if (_uiVisible) _restartHideTimer();
+        },
+        onScaleStart: (_) => setState(() => _isPinching = true),
+        onScaleEnd:   (_) => setState(() => _isPinching = false),
+        onHorizontalDragUpdate: _onHorizontalDragUpdate,
+        onHorizontalDragEnd: _onHorizontalDragEnd,
+        child: Stack(
+          children: [
+            Positioned.fill(child: Container(color: Colors.black.withOpacity(bgAlpha))),
+            Transform.translate(
+              offset: Offset(_dragOffsetX, 0),
+              child: Center(
+                child: _ready && ctrl != null
+                    ? InteractiveViewer(
+                        transformationController: _tc,
+                        minScale: 1.0,
+                        maxScale: 5.0,
+                        panEnabled: true,
+                        scaleEnabled: true,
+                        clipBehavior: Clip.none,
+                        onInteractionUpdate: _onInteractionUpdate,
+                        child: AspectRatio(
+                          aspectRatio: ctrl.value.aspectRatio,
+                          child: VideoPlayer(ctrl),
+                        ),
+                      )
+                    : const CircularProgressIndicator(color: Colors.white70),
+              ),
+            ),
+            // Верхняя панель
+            AnimatedSlide(
+              offset: _uiVisible ? Offset.zero : const Offset(0, -1),
+              duration: const Duration(milliseconds: 200),
+              child: SafeArea(
+                child: Container(
+                  height: 56,
+                  decoration: BoxDecoration(
+                    gradient: LinearGradient(
+                      colors: [Colors.black.withOpacity(0.20), Colors.transparent],
+                      begin: Alignment.topCenter,
+                      end: Alignment.bottomCenter,
+                    ),
+                  ),
+                  padding: const EdgeInsets.symmetric(horizontal: 8),
+                  child: Row(
+                    children: [
+                      TextButton.icon(
+                        style: TextButton.styleFrom(foregroundColor: Colors.white),
+                        onPressed: () => Navigator.of(context).pop(),
+                        icon: const Icon(Icons.arrow_back),
+                        label: const Text('Назад'),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          widget.title,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+            // Нижние контролы
+            AnimatedSlide(
+              offset: _uiVisible ? Offset.zero : const Offset(0, 1),
+              duration: const Duration(milliseconds: 200),
+              child: SafeArea(
+                child: Align(
+                  alignment: Alignment.bottomCenter,
+                  child: Container(
+                    padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
+                    decoration: BoxDecoration(
+                      gradient: LinearGradient(
+                        colors: [Colors.transparent, Colors.black.withOpacity(0.24)],
+                        begin: Alignment.topCenter,
+                        end: Alignment.bottomCenter,
+                      ),
+                    ),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Row(
+                          children: [
+                            Text(_fmt(_pos), style: const TextStyle(color: Colors.white, fontFeatures: [ui.FontFeature.tabularFigures()])),
+                            const Spacer(),
+                            Text(_fmt(_dur), style: const TextStyle(color: Colors.white, fontFeatures: [ui.FontFeature.tabularFigures()])),
+                          ],
+                        ),
+                        SliderTheme(
+                          data: SliderTheme.of(context).copyWith(trackHeight: 4, thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 7)),
+                          child: Slider(
+                            value: _dur.inMilliseconds == 0 ? 0 : _pos.inMilliseconds.clamp(0, _dur.inMilliseconds).toDouble(),
+                            min: 0,
+                            max: (_dur.inMilliseconds == 0 ? 1 : _dur.inMilliseconds).toDouble(),
+                            onChangeStart: (_) => _hideTimer?.cancel(),
+                            onChanged: (v) => setState(() => _pos = Duration(milliseconds: v.toInt())),
+                            onChangeEnd: (v) {
+                              ctrl?.seekTo(Duration(milliseconds: v.toInt()));
+                              _restartHideTimer();
+                            },
+                          ),
+                        ),
+                        const SizedBox(height: 4),
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            IconButton(iconSize: 36, color: Colors.white, icon: const Icon(Icons.replay_10), onPressed: () => _seekRelative(-10)),
+                            const SizedBox(width: 12),
+                            FilledButton(
+                              onPressed: ctrl == null
+                                  ? null
+                                  : () {
+                                      if (ctrl.value.isPlaying) {
+                                        ctrl.pause();
+                                      } else {
+                                        ctrl.play();
+                                      }
+                                      setState(() {});
+                                      _restartHideTimer();
+                                    },
+                              child: Icon(ctrl != null && ctrl.value.isPlaying ? Icons.pause : Icons.play_arrow, size: 28),
+                            ),
+                            const SizedBox(width: 12),
+                            IconButton(iconSize: 36, color: Colors.white, icon: const Icon(Icons.forward_10), onPressed: () => _seekRelative(10)),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            if (!_uiVisible)
+              SafeArea(
+                child: Align(
+                  alignment: Alignment.bottomCenter,
+                  child: SizedBox(
+                    height: 2,
+                    child: LinearProgressIndicator(
+                      value: _dur.inMilliseconds == 0 ? null : progress.clamp(0.0, 1.0),
+                      backgroundColor: Colors.white.withOpacity(0.15),
+                      valueColor: AlwaysStoppedAnimation<Color>(Colors.white.withOpacity(0.9)),
+                    ),
+                  ),
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// -------------------- Быстрый кеш хвоста сообщений (+ медиа) --------------------
+
+class TalkCache {
+  static const _maxKeep = 80;
+
+  static Future<File> _file(String roomToken) async {
+    final dir = await getApplicationDocumentsDirectory();
+    return File(p.join(dir.path, 'talk_tail_$roomToken.json'));
+  }
+
+  /// Старый метод (оставлен для совместимости)
+  static Future<void> saveTail(String roomToken, List<NcMessage> all) async {
+    try {
+      final visible = all.where((m) => !m.isSystemLike).toList();
+      final tail = visible.length <= _maxKeep ? visible : visible.sublist(visible.length - _maxKeep);
+      final file = await _file(roomToken);
+      final jsonList = tail.map((m) => m.toCacheJson()).toList();
+      await file.writeAsString(jsonEncode(jsonList));
+    } catch (_) {}
+  }
+
+  /// Новый метод: сохраняет хвост + подкачивает изображения в дисковый кэш
+  static Future<void> saveTailWithMedia(NextcloudTalkApi api, String roomToken, List<NcMessage> all) async {
+    await saveTail(roomToken, all);
+
+    try {
+      final visible = all.where((m) => !m.isSystemLike).toList();
+      final tail = visible.length <= _maxKeep ? visible : visible.sublist(visible.length - _maxKeep);
+
+      // Соберём уникальные URL картинок
+      final urls = <String>{};
+      for (final m in tail) {
+        if (m.isFile && (m.fileMime?.startsWith('image/') ?? false) && m.filePath != null) {
+          urls.add(api.webdavFileUrl(m.filePath!));
+        }
+      }
+      if (urls.isEmpty) return;
+
+      // Групповая подкачка с ограничением параллелизма (4)
+      const batch = 4;
+      final list = urls.toList();
+      for (int i = 0; i < list.length; i += batch) {
+        final slice = list.sublist(i, i + batch > list.length ? list.length : i + batch);
+        await Future.wait(slice.map((url) async {
+          if (await ImageDiskCache.exists(url)) return;
+          try {
+            final r = await http.get(Uri.parse(url), headers: api.authHeaders);
+            if (r.statusCode == 200 && r.bodyBytes.isNotEmpty) {
+              await ImageDiskCache.put(url, r.bodyBytes);
+            }
+          } catch (_) {}
+        }));
+      }
+    } catch (_) {}
+  }
+
+  static Future<List<NcMessage>?> loadTail(String roomToken) async {
+    try {
+      final file = await _file(roomToken);
+      if (!await file.exists()) return null;
+      final s = await file.readAsString();
+      final arr = (jsonDecode(s) as List).cast<Map<String, dynamic>>();
+      return arr.map((j) => NcMessage.fromCacheJson(j)).toList();
+    } catch (_) {
+      return null;
+    }
+  }
+}
+
+// -------------------- Дисковый кэш изображений --------------------
+
+class ImageDiskCache {
+  static const _subdir = 'img_cache';
+  static const _maxCount = 150; // хватит для последних диалогов
+
+  static Future<Directory> _dir() async {
+    final base = await getTemporaryDirectory();
+    final d = Directory(p.join(base.path, _subdir));
+    if (!await d.exists()) await d.create(recursive: true);
+    return d;
+  }
+
+  static String _hash(String s) {
+    // Простой 32-бит Jenkins hash -> hex
+    int hash = 0;
+    for (final codeUnit in s.codeUnits) {
+      hash += codeUnit;
+      hash += (hash << 10);
+      hash ^= (hash >> 6);
+    }
+    hash += (hash << 3);
+    hash ^= (hash >> 11);
+    hash += (hash << 15);
+    // в hex (знак не важен)
+    final h = hash & 0xFFFFFFFF;
+    return h.toRadixString(16).padLeft(8, '0');
+  }
+
+  static Future<File> _fileFor(String url) async {
+    final d = await _dir();
+    final ext = () {
+      try {
+        final u = Uri.parse(url);
+        final name = p.basename(u.path);
+        final e = p.extension(name);
+        if (e.length >= 2 && e.length <= 5) return e; // .jpg .png .webp ...
+      } catch (_) {}
+      return '.bin';
+    }();
+    final name = '${_hash(url)}$ext';
+    return File(p.join(d.path, name));
+  }
+
+  static Future<bool> exists(String url) async {
+    final f = await _fileFor(url);
+    return f.exists();
+  }
+
+  static Future<Uint8List?> get(String url) async {
+    try {
+      final f = await _fileFor(url);
+      if (await f.exists()) {
+        return await f.readAsBytes();
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  static Future<void> put(String url, Uint8List bytes) async {
+    try {
+      final f = await _fileFor(url);
+      await f.writeAsBytes(bytes, flush: false);
+      await _evictIfNeeded();
+    } catch (_) {}
+  }
+
+  static Future<void> _evictIfNeeded() async {
+    try {
+      final d = await _dir();
+      final files = await d
+          .list()
+          .where((e) => e is File)
+          .cast<File>()
+          .toList();
+
+      if (files.length <= _maxCount) return;
+
+      final stats = <File, DateTime>{};
+      for (final f in files) {
+        try {
+          final s = await f.stat();
+          stats[f] = s.modified;
+        } catch (_) {}
+      }
+      final sorted = stats.entries.toList()
+        ..sort((a, b) => a.value.compareTo(b.value)); // старые в начале
+      final toDelete = sorted.take(sorted.length - _maxCount).map((e) => e.key);
+      for (final f in toDelete) {
+        try { await f.delete(); } catch (_) {}
+      }
+    } catch (_) {}
+  }
+}
+
+// ===================== API & MODELS =====================
+
+class NextcloudTalkApi {
+  NextcloudTalkApi(this.username, this.appPassword);
+  final String username;
+  final String appPassword;
+
+  Map<String, String> get _headers => {
+        'OCS-APIRequest': 'true',
+        'Accept': 'application/json',
+        'Authorization': 'Basic ${base64Encode(utf8.encode('$username:$appPassword'))}',
+      };
+
+  Map<String, String> get authHeaders => {
+        'Authorization': 'Basic ${base64Encode(utf8.encode('$username:$appPassword'))}',
+      };
+
+  Uri _u(String path, [Map<String, String>? q]) => Uri.parse(kNcBase + path).replace(queryParameters: q);
+
+  String webdavFileUrl(String pathFromRoot) {
+    final normalized = pathFromRoot.startsWith('/') ? pathFromRoot : '/$pathFromRoot';
+    return '$kNcBase/remote.php/dav/files/$username$normalized';
+  }
+
+  String basicAuthInUrl(String url) {
+    final uri = Uri.parse(url);
+    final userInfo = '$username:$appPassword';
+    return uri.replace(userInfo: userInfo).toString();
+  }
+
+  // ---- Rooms, participants, contacts ----
+
+  Future<List<NcRoom>> listRooms({int limit = 100, bool includeStatus = false}) async {
+    final url = _u('/ocs/v2.php/apps/spreed/api/v4/room', {
+      'format': 'json',
+      'limit': '$limit',
+      if (includeStatus) 'includeStatus': '1',
+    });
+    final r = await http.get(url, headers: _headers);
+    if (r.statusCode != 200) {
+      throw Exception('listRooms HTTP ${r.statusCode}: ${r.body}');
+    }
+    final data = jsonDecode(r.body);
+    final list = (data['ocs']?['data'] as List?) ?? const [];
+    return list.map((e) => NcRoom.fromJson((e as Map).cast<String, dynamic>())).toList();
+  }
+
+  Future<List<NcParticipant>> listParticipants(String token, {bool includeStatus = false}) async {
+    final url = _u('/ocs/v2.php/apps/spreed/api/v4/room/$token', {
+      'format': 'json',
+      if (includeStatus) 'includeStatus': '1',
+    });
+    final r = await http.get(url, headers: _headers);
+    if (r.statusCode != 200) throw Exception('participants HTTP ${r.statusCode}: ${r.body}');
+    final data = jsonDecode(r.body);
+    final arr = (data['ocs']?['data']?['participants'] as List?) ?? const [];
+    return arr.map((e) => NcParticipant.fromJson((e as Map).cast<String, dynamic>())).toList();
+  }
+
+  Future<NcRoom> createOrGetOneToOne(String userId) async {
+    final url = _u('/ocs/v2.php/apps/spreed/api/v4/room', {'format': 'json'});
+    final r = await http.post(
+      url,
+      headers: {..._headers, 'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8'},
+      body: {'roomType': '1', 'invite': userId},
+    );
+    if (r.statusCode != 200 && r.statusCode != 201) {
+      throw Exception('create 1:1 HTTP ${r.statusCode}: ${r.body}');
+    }
+    final data = jsonDecode(r.body);
+    final j = (data['ocs']?['data'] as Map?)?.cast<String, dynamic>() ?? {};
+    return NcRoom.fromJson(j);
+  }
+
+  // ---- Messaging (paged) ----
+
+  Future<NcPage> fetchMessagesPaged(
+  String token, {
+  int lookIntoFuture = 1,
+  int? lastKnownId,
+  int limit = 100,
+  int setReadMarker = 0,
+  int markNotificationsAsRead = 0,
+}) async {
+  final q = <String, String>{
+    'format': 'json',
+    'lookIntoFuture': '$lookIntoFuture',
+    'limit': '$limit',
+    'setReadMarker': '$setReadMarker',
+    'markNotificationsAsRead': '$markNotificationsAsRead',
+  };
+  if (lastKnownId != null) q['lastKnownMessageId'] = '$lastKnownId';
+
+  final url = _u('/ocs/v2.php/apps/spreed/api/v1/chat/$token', q);
+
+  bool _isTransient(int code) => code == 502 || code == 503 || code == 504 || code == 408;
+
+  Future<http.Response?> _tryOnce() async {
+    try {
+      return await http.get(url, headers: _headers).timeout(const Duration(seconds: 35));
+    } on TimeoutException {
+      return null; // помечаем как транзитный фейл
+    }
+  }
+
+  // 1-я попытка
+  http.Response? r = await _tryOnce();
+
+  // При транзитном фейле сделаем короткий бэкофф и повторим 1 раз
+  if (r == null || _isTransient(r.statusCode)) {
+    await Future.delayed(const Duration(milliseconds: 400));
+    r = await _tryOnce();
+  }
+
+  // Если после повторной попытки трансient или таймаут — вернём «пусто»
+  if (r == null) {
+    return NcPage(messages: const [], lastGiven: lastKnownId);
+  }
+
+  // 304 — как обычно
+  if (r.statusCode == 304) {
+    return NcPage(messages: const [], lastGiven: lastKnownId);
+  }
+
+  // Любые транзитные коды — «пусто», без ошибок UI
+  if (_isTransient(r.statusCode)) {
+    return NcPage(messages: const [], lastGiven: lastKnownId);
+  }
+
+  // Нестандартные не-200 — компактное исключение без HTML
+  if (r.statusCode != 200) {
+    final code = r.statusCode;
+    final ct = (r.headers['content-type'] ?? '').toLowerCase();
+    final brief = ct.contains('application/json') ? r.body : 'HTTP $code';
+    throw Exception('fetchMessages HTTP $code: $brief');
+  }
+
+  // --- нормальный парс ---
+  final data = jsonDecode(r.body);
+  final dataNode = data['ocs']?['data'];
+
+  List<dynamic> raw = const [];
+  if (dataNode is Map) {
+    final m = dataNode['message'];
+    if (m is List) raw = m; else if (m is Map) raw = (m as Map).values.toList();
+  } else if (dataNode is List) {
+    raw = dataNode;
+  }
+
+  final out = <NcMessage>[];
+  for (final e in raw) {
+    if (e is Map) out.add(NcMessage.fromJson((e as Map).cast<String, dynamic>()));
+  }
+  final lastGivenHeader = r.headers['x-chat-last-given'];
+  final lastGiven = int.tryParse(lastGivenHeader ?? '') ?? lastKnownId;
+
+  return NcPage(messages: out, lastGiven: lastGiven);
+}
+
+
+
+  Future<void> sendMessage(String token, String message, {int? replyTo}) async {
+    final url = _u('/ocs/v2.php/apps/spreed/api/v1/chat/$token', {'format': 'json'});
+    final body = <String, String>{'message': message};
+    if (replyTo != null) body['replyTo'] = '$replyTo';
+    final r = await http.post(
+      url,
+      headers: {
+        ..._headers,
+        'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8',
+      },
+      body: body,
+    );
+    if (r.statusCode != 200 && r.statusCode != 201) {
+      throw Exception('sendMessage HTTP ${r.statusCode}: ${r.body}');
+    }
+  }
+
+  Future<void> sendFileToChat(
+    String token,
+    File file, {
+    String? overrideName,
+    int? replyTo,
+    String? caption,
+    String? messageType,
+  }) async {
+    final name = overrideName ?? p.basename(file.path);
+    final remotePath = '/Talk/${DateTime.now().millisecondsSinceEpoch}_$name';
+    await _webdavUpload(file, remotePath);
+    await shareExistingFileToChat(
+      token,
+      remotePath,
+      caption: caption,
+      replyTo: replyTo,
+      messageType: messageType,
+    );
+  }
+
+  Future<void> _webdavUpload(File file, String remotePath) async {
+    final url = webdavFileUrl(remotePath);
+    final bytes = await file.readAsBytes();
+    final r = await http.put(Uri.parse(url), headers: authHeaders, body: bytes);
+    if (r.statusCode != 201 && r.statusCode != 200 && r.statusCode != 204) {
+      throw Exception('WebDAV upload HTTP ${r.statusCode}: ${r.body}');
+    }
+  }
+
+  Future<void> shareExistingFileToChat(
+    String token,
+    String remotePath, {
+    String? caption,
+    int? replyTo,
+    String? messageType,
+  }) async {
+    final url = _u('/ocs/v2.php/apps/files_sharing/api/v1/shares', {'format': 'json'});
+    final talkMeta = <String, dynamic>{};
+    if (caption != null && caption.isNotEmpty) talkMeta['caption'] = caption;
+    if (replyTo != null) talkMeta['replyTo'] = replyTo;
+    if (messageType != null) talkMeta['messageType'] = messageType;
+
+    final body = <String, String>{
+      'shareType': '10',
+      'shareWith': token,
+      'path': remotePath,
+    };
+    if (talkMeta.isNotEmpty) {
+      body['talkMetaData'] = jsonEncode(talkMeta);
+    }
+
+    final r = await http.post(
+      url,
+      headers: {
+        ..._headers,
+        'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8',
+      },
+      body: body,
+    );
+    if (r.statusCode != 200 && r.statusCode != 201) {
+      throw Exception('shareToChat HTTP ${r.statusCode}: ${r.body}');
+    }
+  }
+
+  Future<void> addReaction(String token, int messageId, String emoji) async {
+    final url = _u('/ocs/v2.php/apps/spreed/api/v1/reaction/$token/$messageId', {'format': 'json'});
+    final r = await http.post(
+      url,
+      headers: {
+        ..._headers,
+        'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8',
+      },
+      body: {'reaction': emoji},
+    );
+    if (r.statusCode != 200 && r.statusCode != 201) {
+      throw Exception('addReaction HTTP ${r.statusCode}: ${r.body}');
+    }
+  }
+
+  Future<void> deleteReaction(String token, int messageId, String emoji) async {
+    final url = Uri.parse(kNcBase + '/ocs/v2.php/apps/spreed/api/v1/reaction/$token/$messageId?format=json');
+    final req = http.Request('DELETE', url)
+      ..headers.addAll({
+        ..._headers,
+        'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8',
+      })
+      ..bodyFields = {'reaction': emoji};
+    final resp = await http.Client().send(req);
+    final code = resp.statusCode;
+    if (code != 200 && code != 201) {
+      final body = await resp.stream.bytesToString();
+      throw Exception('deleteReaction HTTP $code: $body');
+    }
+  }
+
+  Future<void> editMessage(String token, int messageId, String newText) async {
+    final url = _u('/ocs/v2.php/apps/spreed/api/v1/chat/$token/$messageId', {'format': 'json'});
+    final r = await http.put(url,
+        headers: {
+          ..._headers,
+          'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8',
+        },
+        body: {'message': newText});
+    if (r.statusCode != 200 && r.statusCode != 202) {
+      throw Exception('editMessage HTTP ${r.statusCode}: ${r.body}');
+    }
+  }
+
+  Future<void> deleteMessage(String token, int messageId) async {
+    final url = _u('/ocs/v2.php/apps/spreed/api/v1/chat/$token/$messageId', {'format': 'json'});
+    final r = await http.delete(url, headers: _headers);
+    if (r.statusCode != 200 && r.statusCode != 202) {
+      throw Exception('deleteMessage HTTP ${r.statusCode}: ${r.body}');
+    }
+  }
+}
+
+class NcPage {
+  NcPage({required this.messages, required this.lastGiven});
+  final List<NcMessage> messages;
+  final int? lastGiven;
+}
+
+class NcRoom {
+  NcRoom({
+    required this.token,
+    required this.displayName,
+    this.lastMessage,
+    this.type,
+    this.lastActivity,
+  });
+
+  final String token;
+  final String displayName;
+  final String? lastMessage;
+  final int? type;          // 1 = 1:1
+  final int? lastActivity;  // unix sec
+
+  factory NcRoom.fromJson(Map<String, dynamic> j) {
+    String _s(dynamic v) => v?.toString() ?? '';
+    int _i(dynamic v) {
+      if (v is int) return v;
+      if (v is String) return int.tryParse(v) ?? 0;
+      if (v is double) return v.toInt();
+      return 0;
+    }
+
+    final token = _s(j['token'] ?? j['roomToken']);
+    final name  = _s(j['displayName'] ?? j['name']);
+    String? last;
+    try {
+      last = (j['lastMessage']?['message']?['message'] ?? j['lastMessage']?['message'] ?? j['lastMessage'])?.toString();
+    } catch (_) {}
+
+    int? lastAct;
+    try {
+      final la = j['lastActivity'] ?? j['lastActivityTime'];
+      lastAct = la == null ? null : _i(la);
+    } catch (_) {}
+
+    final t = j['type'] ?? j['roomType'];
+
+    return NcRoom(
+      token: token,
+      displayName: name,
+      lastMessage: (last?.isEmpty ?? true) ? null : last,
+      type: t == null ? null : _i(t),
+      lastActivity: lastAct,
+    );
+  }
+}
+
+class NcParticipant {
+  NcParticipant({required this.actorType, this.actorId, this.displayName});
+  final String actorType; // 'users'
+  final String? actorId;
+  final String? displayName;
+
+  factory NcParticipant.fromJson(Map<String, dynamic> j) {
+    return NcParticipant(
+      actorType: (j['actorType'] ?? j['type'] ?? '').toString(),
+      actorId: (j['actorId'] ?? j['id'] ?? '').toString(),
+      displayName: (j['displayName'] ?? j['name'] ?? '').toString(),
+    );
+  }
+}
+
+class NcMessage {
+  NcMessage({
+    required this.id,
+    this.actorId,
+    this.actorDisplayName,
+    this.message,
+    required this.timestamp,
+    this.isFile = false,
+    this.filePath,
+    this.fileId,
+    this.fileMime,
+    this.messageType,
+    this.isSystemLike = false,
+    this.parentId,
+    this.parentAuthor,
+    this.parentText,
+    this.parentIsFile = false,
+    this.parentFileName,
+    this.reactions = const {},
+    this.reactionsSelf = const [],
+  });
+
+  final int id;
+  final String? actorId;
+  final String? actorDisplayName;
+  final String? message;
+  final int timestamp;
+
+  final bool isFile;
+  final String? filePath;
+  final int? fileId;
+  final String? fileMime;
+
+  final String? messageType;
+  final bool isSystemLike;
+
+  // Reply info
+  final int? parentId;
+  final String? parentAuthor;
+  final String? parentText;
+  final bool parentIsFile;
+  final String? parentFileName;
+
+  final Map<String, int> reactions;
+  final List<String> reactionsSelf;
+
+  factory NcMessage.fromJson(Map<String, dynamic> j) {
+    int _toInt(dynamic v) {
+      if (v is int) return v;
+      if (v is String) return int.tryParse(v) ?? 0;
+      if (v is double) return v.toInt();
+      return 0;
+    }
+
+    String? _toString(dynamic v) => v?.toString();
+
+    bool isFile = false;
+    String? filePath;
+    int? fileId;
+    String? fileMime;
+
+    bool systemish = false;
+
+    try {
+      final params = j['parameters'] ?? j['messageParameters'] ?? j['message_parameter'];
+      if (params is Map) {
+        final file = params['file'] ?? params['FILE'] ?? params['attachment'] ?? params['Attachment'];
+        if (file is Map) {
+          final rich = file['richObject'] ?? file['object'] ?? file;
+          if (rich is Map) {
+            filePath = _toString(rich['path'] ?? rich['link'] ?? rich['file'] ?? rich['name']);
+            fileId = _toInt(rich['id']);
+            fileMime = _toString(rich['mimetype'] ?? rich['mime'] ?? lookupMimeType(filePath ?? ''));
+            isFile = filePath != null;
+          }
+        }
+        if (params.containsKey('reaction') || params.containsKey('REACTION')) {
+          systemish = true;
+        }
+      }
+    } catch (_) {}
+
+    final mtRaw = _toString(j['messageType'] ?? j['type'] ?? j['message_type']);
+    final mt = mtRaw?.toLowerCase();
+    if (mt != null) {
+      if (mt.contains('system') ||
+          mt.contains('reaction') ||
+          mt.contains('activity') ||
+          mt.contains('deleted') ||
+          mt.contains('edit')) {
+        systemish = true;
+      }
+    }
+    final msgText = _toString(j['message'])?.toLowerCase() ?? '';
+    if (msgText.contains('you edited') ||
+        msgText.contains('вы изменили') ||
+        msgText.contains('изменил') ||
+        msgText.contains('удалил') ||
+        msgText.contains('deleted') ||
+        msgText.contains('reacted') ||
+        msgText.contains('реакц')) {
+      systemish = true;
+    }
+
+    // Parent info
+    int? parentId;
+    String? parentAuthor;
+    String? parentText;
+    bool parentIsFile = false;
+    String? parentFileName;
+
+    try {
+      final parent = j['parent'];
+      if (parent is Map) {
+        parentId = _toInt(parent['id']);
+        parentAuthor = _toString(parent['actorDisplayName'] ?? parent['actorId']);
+        parentText = _toString(parent['message']);
+        final pParams = parent['parameters'] ?? parent['messageParameters'];
+        if (pParams is Map) {
+          final f = pParams['file'] ?? pParams['attachment'];
+          if (f is Map) {
+            final rich = f['richObject'] ?? f['object'] ?? f;
+            if (rich is Map) {
+              parentFileName = _toString(rich['name'] ?? rich['path'] ?? rich['file']);
+              parentIsFile = true;
+            }
+          }
+        }
+      }
+    } catch (_) {}
+
+    // Reactions
+    Map<String, int> reactions = {};
+    final rs = j['reactions'];
+    if (rs is Map) {
+      reactions = rs.map((k, v) => MapEntry(k.toString(), _toInt(v)));
+    }
+    List<String> reactionsSelf = [];
+    final rself = j['reactionsSelf'];
+    if (rself is List) {
+      reactionsSelf = rself.map((e) => e.toString()).toList();
+    }
+
+    return NcMessage(
+      id: _toInt(j['id']),
+      actorId: _toString(j['actorId']),
+      actorDisplayName: _toString(j['actorDisplayName']),
+      message: _toString(j['message']),
+      timestamp: _toInt(j['timestamp']),
+      isFile: isFile,
+      filePath: filePath,
+      fileId: fileId,
+      fileMime: fileMime,
+      messageType: mtRaw,
+      isSystemLike: systemish,
+      parentId: parentId,
+      parentAuthor: parentAuthor,
+      parentText: parentText,
+      parentIsFile: parentIsFile,
+      parentFileName: parentFileName,
+      reactions: reactions,
+      reactionsSelf: reactionsSelf,
+    );
+  }
+
+  // --- сериализация для кеша (минимум полей) ---
+  Map<String, dynamic> toCacheJson() => {
+        'id': id,
+        'actorId': actorId,
+        'actorDisplayName': actorDisplayName,
+        'message': message,
+        'timestamp': timestamp,
+        'isFile': isFile,
+        'filePath': filePath,
+        'fileMime': fileMime,
+        'messageType': messageType,
+        'parentId': parentId,
+        'parentAuthor': parentAuthor,
+        'parentText': parentText,
+        'parentIsFile': parentIsFile,
+        'parentFileName': parentFileName,
+        'reactions': reactions,
+        'reactionsSelf': reactionsSelf,
+      };
+
+  factory NcMessage.fromCacheJson(Map<String, dynamic> j) => NcMessage(
+        id: (j['id'] as num).toInt(),
+        actorId: j['actorId'] as String?,
+        actorDisplayName: j['actorDisplayName'] as String?,
+        message: j['message'] as String?,
+        timestamp: (j['timestamp'] as num).toInt(),
+        isFile: (j['isFile'] as bool?) ?? false,
+        filePath: j['filePath'] as String?,
+        fileMime: j['fileMime'] as String?,
+        messageType: j['messageType'] as String?,
+        parentId: (j['parentId'] as num?)?.toInt(),
+        parentAuthor: j['parentAuthor'] as String?,
+        parentText: j['parentText'] as String?,
+        parentIsFile: (j['parentIsFile'] as bool?) ?? false,
+        parentFileName: j['parentFileName'] as String?,
+        reactions: (j['reactions'] as Map?)?.map((k, v) => MapEntry(k.toString(), (v as num).toInt())) ?? const {},
+        reactionsSelf: (j['reactionsSelf'] as List?)?.map((e) => e.toString()).toList() ?? const [],
+      );
+}
+
+class MathUtils {
+  static double sin(double x) => MathUtils._sine(x);
+  static double _sine(double x) {
+    const pi = 3.1415926535897932;
+    x = x % (2 * pi);
+    final x2 = x * x;
+    final x3 = x2 * x;
+    final x5 = x3 * x2;
+    final x7 = x5 * x2;
+    final x9 = x7 * x2;
+    return x - x3 / 6 + x5 / 120 - x7 / 5040 + x9 / 362880;
+  }
+}
